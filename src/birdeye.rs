@@ -1,0 +1,218 @@
+use reqwest::header::{HeaderMap, HeaderValue};
+use serde::Deserialize;
+
+// ============================================================
+// Birdeye API Client — Core Data Source for HawkEye Shield
+// Replaces: DexScreener + GMGN from the original meme-sniper
+// ============================================================
+
+#[derive(Clone)]
+pub struct BirdeyeClient {
+    client: reqwest::Client,
+    base_url: String,
+}
+
+impl BirdeyeClient {
+    pub fn new(api_key: &str) -> Self {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-API-KEY", HeaderValue::from_str(api_key).unwrap_or(HeaderValue::from_static("")));
+        headers.insert("x-chain", HeaderValue::from_static("solana"));
+        headers.insert("accept", HeaderValue::from_static("application/json"));
+
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("Failed to build HTTP client");
+
+        Self {
+            client,
+            base_url: "https://public-api.birdeye.so".to_string(),
+        }
+    }
+
+    // ─── Trending Tokens (replaces DexScreener trending) ───
+    pub async fn get_trending(&self) -> Result<Vec<TrendingToken>, String> {
+        let url = format!("{}/defi/token_trending?sort_by=rank&sort_type=asc&offset=0&limit=20", self.base_url);
+        let resp = self.client.get(&url).send().await.map_err(|e| e.to_string())?;
+        let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+
+        let tokens = body["data"]["tokens"].as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .filter_map(|t| {
+                Some(TrendingToken {
+                    address: t["address"].as_str()?.to_string(),
+                    symbol: t["symbol"].as_str().unwrap_or("???").to_string(),
+                    name: t["name"].as_str().unwrap_or("Unknown").to_string(),
+                    price: t["price"].as_f64(),
+                    volume_24h: t["volume24hUSD"].as_f64(),
+                    price_change_24h: t["priceChange24hPercent"].as_f64(),
+                    liquidity: t["liquidity"].as_f64(),
+                    rank: t["rank"].as_u64().unwrap_or(999),
+                })
+            })
+            .collect();
+
+        Ok(tokens)
+    }
+
+    // ─── New Listings (replaces DexScreener profiles) ───
+    pub async fn get_new_listings(&self) -> Result<Vec<NewListing>, String> {
+        let url = format!("{}/defi/v3/token/new_listing?limit=20", self.base_url);
+        let resp = self.client.get(&url).send().await.map_err(|e| e.to_string())?;
+        let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+
+        let items = body["data"]["items"].as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .filter_map(|t| {
+                Some(NewListing {
+                    address: t["address"].as_str()?.to_string(),
+                    symbol: t["symbol"].as_str().unwrap_or("???").to_string(),
+                    name: t["name"].as_str().unwrap_or("Unknown").to_string(),
+                    price: t["price"].as_f64(),
+                    liquidity: t["liquidity"].as_f64(),
+                    listing_time: t["openTimestamp"].as_i64(),
+                })
+            })
+            .collect();
+
+        Ok(items)
+    }
+
+    // ─── Token Price (replaces Jupiter Price API fallback) ───
+    pub async fn get_price(&self, address: &str) -> Result<f64, String> {
+        let url = format!("{}/defi/price?address={}", self.base_url, address);
+        let resp = self.client.get(&url).send().await.map_err(|e| e.to_string())?;
+        let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+
+        body["data"]["value"].as_f64()
+            .ok_or_else(|| "Price not found".to_string())
+    }
+
+    // ─── Token Overview (replaces DexScreener token data) ───
+    pub async fn get_token_overview(&self, address: &str) -> Result<TokenOverview, String> {
+        let url = format!("{}/defi/token_overview?address={}", self.base_url, address);
+        let resp = self.client.get(&url).send().await.map_err(|e| e.to_string())?;
+        let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        let d = &body["data"];
+
+        Ok(TokenOverview {
+            address: d["address"].as_str().unwrap_or("").to_string(),
+            symbol: d["symbol"].as_str().unwrap_or("???").to_string(),
+            name: d["name"].as_str().unwrap_or("Unknown").to_string(),
+            price: d["price"].as_f64().unwrap_or(0.0),
+            liquidity: d["liquidity"].as_f64().unwrap_or(0.0),
+            volume_24h: d["v24hUSD"].as_f64().unwrap_or(0.0),
+            price_change_5m: d["priceChange5mPercent"].as_f64().unwrap_or(0.0),
+            price_change_1h: d["priceChange1hPercent"].as_f64().unwrap_or(0.0),
+            price_change_24h: d["priceChange24hPercent"].as_f64().unwrap_or(0.0),
+            buy_5m: d["buy5m"].as_u64().unwrap_or(0),
+            sell_5m: d["sell5m"].as_u64().unwrap_or(0),
+            volume_5m: d["v5mUSD"].as_f64().unwrap_or(0.0),
+            volume_1h: d["v1hUSD"].as_f64().unwrap_or(0.0),
+            market_cap: d["mc"].as_f64().unwrap_or(0.0),
+            created_at: d["createdAt"].as_i64(),
+        })
+    }
+
+    // ─── Token Security (replaces GMGN safety check) ───
+    pub async fn get_token_security(&self, address: &str) -> Result<TokenSecurity, String> {
+        let url = format!("{}/defi/token_security?address={}", self.base_url, address);
+        let resp = self.client.get(&url).send().await.map_err(|e| e.to_string())?;
+        let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        let d = &body["data"];
+
+        Ok(TokenSecurity {
+            is_mintable: d["isMintable"].as_bool(),
+            is_freezable: d["isFreezable"].as_bool(),
+            top10_holder_percent: d["top10HolderPercent"].as_f64(),
+            creator_percentage: d["creatorPercentage"].as_f64(),
+            owner_percentage: d["ownerPercentage"].as_f64(),
+            is_true_token: d["isTrueToken"].as_bool(),
+        })
+    }
+
+    // ─── Trade Data (replaces DexScreener txns m5/h1) ───
+    pub async fn get_trade_data(&self, address: &str) -> Result<TradeData, String> {
+        let url = format!("{}/defi/v3/token/trade-data/single?address={}", self.base_url, address);
+        let resp = self.client.get(&url).send().await.map_err(|e| e.to_string())?;
+        let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        let d = &body["data"];
+
+        Ok(TradeData {
+            buy_5m: d["buy5m"].as_u64().unwrap_or(0),
+            sell_5m: d["sell5m"].as_u64().unwrap_or(0),
+            buy_1h: d["buy1h"].as_u64().unwrap_or(0),
+            sell_1h: d["sell1h"].as_u64().unwrap_or(0),
+            volume_5m_usd: d["v5mUSD"].as_f64().unwrap_or(0.0),
+            volume_1h_usd: d["v1hUSD"].as_f64().unwrap_or(0.0),
+            volume_24h_usd: d["v24hUSD"].as_f64().unwrap_or(0.0),
+        })
+    }
+}
+
+// ─── Data Structures ───
+
+#[derive(Debug, Clone)]
+pub struct TrendingToken {
+    pub address: String,
+    pub symbol: String,
+    pub name: String,
+    pub price: Option<f64>,
+    pub volume_24h: Option<f64>,
+    pub price_change_24h: Option<f64>,
+    pub liquidity: Option<f64>,
+    pub rank: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewListing {
+    pub address: String,
+    pub symbol: String,
+    pub name: String,
+    pub price: Option<f64>,
+    pub liquidity: Option<f64>,
+    pub listing_time: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TokenOverview {
+    pub address: String,
+    pub symbol: String,
+    pub name: String,
+    pub price: f64,
+    pub liquidity: f64,
+    pub volume_24h: f64,
+    pub price_change_5m: f64,
+    pub price_change_1h: f64,
+    pub price_change_24h: f64,
+    pub buy_5m: u64,
+    pub sell_5m: u64,
+    pub volume_5m: f64,
+    pub volume_1h: f64,
+    pub market_cap: f64,
+    pub created_at: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TokenSecurity {
+    pub is_mintable: Option<bool>,
+    pub is_freezable: Option<bool>,
+    pub top10_holder_percent: Option<f64>,
+    pub creator_percentage: Option<f64>,
+    pub owner_percentage: Option<f64>,
+    pub is_true_token: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TradeData {
+    pub buy_5m: u64,
+    pub sell_5m: u64,
+    pub buy_1h: u64,
+    pub sell_1h: u64,
+    pub volume_5m_usd: f64,
+    pub volume_1h_usd: f64,
+    pub volume_24h_usd: f64,
+}

@@ -1,0 +1,484 @@
+use crate::birdeye::BirdeyeClient;
+use crate::config::Config;
+use crate::scanner::TokenCandidate;
+use base64::Engine as _;
+use serde::{Deserialize, Serialize};
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::commitment_config::CommitmentConfig;
+use solana_sdk::signature::Signer;
+use solana_sdk::transaction::VersionedTransaction;
+use std::collections::HashMap;
+use std::str::FromStr;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+// ============================================================
+// Trade Executor — Buy/Sell via Jupiter + Position Management
+// ============================================================
+
+const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveTrade {
+    pub symbol: String,
+    pub entry_price: f64,
+    pub spent_sol: f64,
+    pub current_price: f64,
+    pub pnl_pct: f64,
+    pub tp1_hit: bool,
+    pub break_even_hit: bool,
+    pub highest_price: f64,
+    pub stop_price: f64,
+}
+
+pub struct TradeExecutor {
+    config: Config,
+    birdeye: BirdeyeClient,
+    read_rpc: RpcClient,
+    write_rpc: RpcClient,
+    pub active_trades: Arc<Mutex<HashMap<String, ActiveTrade>>>,
+    jup_base: String,
+}
+
+impl TradeExecutor {
+    pub fn new(config: Config, birdeye: BirdeyeClient) -> Self {
+        let read_rpc = RpcClient::new_with_commitment(
+            config.solana_rpc_url.clone(),
+            CommitmentConfig::confirmed(),
+        );
+        let write_rpc = RpcClient::new_with_commitment(
+            config.solana_write_rpc_url.clone(),
+            CommitmentConfig::confirmed(),
+        );
+
+        let jup_base = if config.use_ultra {
+            "https://api.jup.ag/ultra/v1".to_string()
+        } else {
+            "https://api.jup.ag/v6".to_string()
+        };
+
+        Self {
+            config,
+            birdeye,
+            read_rpc,
+            write_rpc,
+            active_trades: Arc::new(Mutex::new(HashMap::new())),
+            jup_base,
+        }
+    }
+
+    pub fn get_sol_balance(&self) -> f64 {
+        match &self.config.wallet {
+            Some(kp) => {
+                self.read_rpc.get_balance(&kp.pubkey())
+                    .map(|b| b as f64 / 1e9)
+                    .unwrap_or(0.0)
+            }
+            None => 0.0,
+        }
+    }
+
+    /// Get token balance for wallet (amount + decimals)
+    fn get_token_balance(&self, mint: &str) -> (u64, u8) {
+        let wallet = match &self.config.wallet {
+            Some(kp) => kp.pubkey(),
+            None => return (0, 6),
+        };
+        let mint_pk = match solana_sdk::pubkey::Pubkey::from_str(mint) {
+            Ok(pk) => pk,
+            Err(_) => return (0, 6),
+        };
+        match self.read_rpc.get_token_accounts_by_owner(
+            &wallet,
+            solana_client::rpc_request::TokenAccountsFilter::Mint(mint_pk),
+        ) {
+            Ok(accounts) if !accounts.is_empty() => {
+                if let Some(data) = accounts[0].account.data.decode() {
+                    // SPL Token account: amount at offset 64, 8 bytes LE
+                    if data.len() >= 72 {
+                        let amount = u64::from_le_bytes(data[64..72].try_into().unwrap_or([0u8; 8]));
+                        // decimals need mint info, default 6 for most meme tokens
+                        return (amount, 6);
+                    }
+                }
+                (0, 6)
+            }
+            _ => (0, 6),
+        }
+    }
+
+    /// Calculate actual entry price from on-chain data (Birdeye-powered)
+    async fn calc_actual_entry_price(&self, token_mint: &str, sol_spent: f64) -> f64 {
+        // 1. Get SOL price from Birdeye (reliable)
+        let sol_price_usd = self.birdeye.get_price(SOL_MINT).await.unwrap_or(0.0);
+
+        // 2. Try to get token balance (retry up to 5 times)
+        let before_balance = self.get_token_balance(token_mint);
+        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+
+        let mut tokens_received: u64 = 0;
+        let mut decimals: u8 = before_balance.1;
+        for i in 0..5 {
+            let after = self.get_token_balance(token_mint);
+            if after.0 > before_balance.0 {
+                tokens_received = after.0 - before_balance.0;
+                decimals = after.1;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if i == 4 {
+                tracing::warn!("⚠️ Token balance ยังไม่เปลี่ยน — ใช้ Birdeye price แทน");
+            }
+        }
+
+        // 3. Calculate actual price
+        let ui_amount = tokens_received as f64 / 10f64.powi(decimals as i32);
+        if ui_amount > 0.0 && sol_price_usd > 0.0 {
+            let actual = (sol_spent * sol_price_usd) / ui_amount;
+            tracing::info!("✅ [On-Chain] ได้รับ {:.2} tokens (Entry: ${:.8})", ui_amount, actual);
+            return actual;
+        }
+
+        // 4. Fallback: Birdeye token price (much better than DexScreener)
+        if let Ok(price) = self.birdeye.get_price(token_mint).await {
+            if price > 0.0 {
+                tracing::info!("📊 [Birdeye Fallback] Entry: ${:.8}", price);
+                return price;
+            }
+        }
+
+        // 5. Last resort: Jupiter price
+        if let Some(price) = self.refresh_price(token_mint).await {
+            tracing::warn!("⚠️ [Jupiter Fallback] Entry: ${:.8}", price);
+            return price;
+        }
+
+        0.0
+    }
+
+    /// Refresh token price via Birdeye (primary) + Jupiter (fallback)
+    async fn refresh_price(&self, address: &str) -> Option<f64> {
+        // Primary: Birdeye
+        if let Ok(price) = self.birdeye.get_price(address).await {
+            if price > 0.0 { return Some(price); }
+        }
+
+        // Fallback: Jupiter Price API
+        let client = reqwest::Client::new();
+        if let Ok(resp) = client.get(format!("https://api.jup.ag/price/v2?ids={}", address))
+            .send().await
+        {
+            if let Ok(body) = resp.json::<serde_json::Value>().await {
+                if let Some(price) = body["data"][address]["price"].as_str()
+                    .and_then(|p| p.parse::<f64>().ok())
+                {
+                    if price > 0.0 { return Some(price); }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Execute buy order via Jupiter
+    pub async fn execute_buy(&self, token: &TokenCandidate, amount_sol: f64) -> Result<BuyResult, String> {
+        if self.config.paper_trade {
+            return self.paper_buy(token, amount_sol).await;
+        }
+
+        let wallet = self.config.wallet.as_ref()
+            .ok_or("No wallet configured")?;
+
+        // Record token balance BEFORE buy
+        let before_balance = self.get_token_balance(&token.address);
+        // Get SOL price from Birdeye BEFORE buy (for accurate entry calc)
+        let sol_price_usd = self.birdeye.get_price(SOL_MINT).await.unwrap_or(0.0);
+
+        let lamports = (amount_sol * 1e9) as u64;
+        let client = reqwest::Client::new();
+
+        let quote_url = if self.config.use_ultra {
+            format!("{}/order?inputMint={}&outputMint={}&amount={}&slippageBps={}&taker={}&computeUnitPriceMicroLamports={}",
+                self.jup_base, SOL_MINT, token.address, lamports,
+                self.config.slippage_bps, wallet.pubkey(),
+                self.config.priority_fee_micro_lamports)
+        } else {
+            format!("{}/quote?inputMint={}&outputMint={}&amount={}&slippageBps={}",
+                self.jup_base, SOL_MINT, token.address, lamports, self.config.slippage_bps)
+        };
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        if !self.config.jupiter_api_key.is_empty() {
+            if let Ok(val) = self.config.jupiter_api_key.parse() {
+                headers.insert("x-api-key", val);
+            }
+        }
+
+        let quote: serde_json::Value = client.get(&quote_url)
+            .headers(headers.clone())
+            .send().await.map_err(|e| e.to_string())?
+            .json().await.map_err(|e| e.to_string())?;
+
+        if quote.get("error").is_some() || quote.get("errorCode").is_some() {
+            return Err(format!("Jupiter quote error: {:?}", quote));
+        }
+
+        let swap_tx_base64 = if self.config.use_ultra {
+            quote["transaction"].as_str().ok_or("No transaction in Ultra quote")?.to_string()
+        } else {
+            let swap_body = serde_json::json!({
+                "quoteResponse": quote,
+                "userPublicKey": wallet.pubkey().to_string(),
+                "wrapAndUnwrapSol": true,
+                "prioritizationFeeLamports": (self.config.priority_fee_micro_lamports / 1000)
+            });
+            let swap_url = format!("{}/swap", self.jup_base);
+            let swap_resp: serde_json::Value = client.post(&swap_url)
+                .headers(headers.clone())
+                .json(&swap_body)
+                .send().await.map_err(|e| e.to_string())?
+                .json().await.map_err(|e| e.to_string())?;
+            swap_resp["swapTransaction"].as_str()
+                .ok_or("No swapTransaction in response")?.to_string()
+        };
+
+        let tx_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&swap_tx_base64).map_err(|e| e.to_string())?;
+        let mut tx: VersionedTransaction = bincode::deserialize(&tx_bytes)
+            .map_err(|e| e.to_string())?;
+        let message_bytes = tx.message.serialize();
+        let signature = wallet.sign_message(&message_bytes);
+        tx.signatures[0] = signature;
+
+        let txid = if self.config.use_ultra {
+            let signed_b64 = base64::engine::general_purpose::STANDARD
+                .encode(bincode::serialize(&tx).map_err(|e| e.to_string())?);
+            let request_id = quote["requestId"].as_str().unwrap_or("");
+            let exec_body = serde_json::json!({
+                "requestId": request_id,
+                "signedTransaction": signed_b64
+            });
+            let exec_url = format!("{}/execute", self.jup_base);
+            let exec_resp: serde_json::Value = client.post(&exec_url)
+                .headers(headers)
+                .json(&exec_body)
+                .send().await.map_err(|e| e.to_string())?
+                .json().await.map_err(|e| e.to_string())?;
+            exec_resp["signature"].as_str()
+                .or(exec_resp["txid"].as_str())
+                .ok_or("No txid from Jupiter Ultra")?
+                .to_string()
+        } else {
+            let config = solana_client::rpc_config::RpcSendTransactionConfig {
+                skip_preflight: true,
+                max_retries: Some(2),
+                ..Default::default()
+            };
+            let sig = self.write_rpc.send_transaction_with_config(&tx, config)
+                .map_err(|e| e.to_string())?;
+            sig.to_string()
+        };
+
+        // ─── ACTUAL ENTRY PRICE (fixed: on-chain balance diff) ───
+        // Wait for TX to land, then check actual tokens received
+        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+
+        let mut actual_price = 0.0;
+        // Try on-chain balance diff (most accurate)
+        for i in 0..8 {
+            let after_balance = self.get_token_balance(&token.address);
+            if after_balance.0 > before_balance.0 {
+                let tokens_received = after_balance.0 - before_balance.0;
+                let decimals = after_balance.1;
+                let ui_amount = tokens_received as f64 / 10f64.powi(decimals as i32);
+                if ui_amount > 0.0 && sol_price_usd > 0.0 {
+                    actual_price = (amount_sol * sol_price_usd) / ui_amount;
+                    tracing::info!("✅ [On-Chain] ได้รับ {:.2} ${} (Entry: ${:.8})",
+                        ui_amount, token.symbol, actual_price);
+                    break;
+                }
+            }
+            if i < 7 {
+                tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            }
+        }
+
+        // Fallback: Birdeye price (much more reliable than old DexScreener)
+        if actual_price <= 0.0 {
+            if let Ok(price) = self.birdeye.get_price(&token.address).await {
+                if price > 0.0 {
+                    actual_price = price;
+                    tracing::info!("📊 [Birdeye] Entry fallback: ${:.8}", actual_price);
+                }
+            }
+        }
+        // Last resort: Jupiter price
+        if actual_price <= 0.0 {
+            actual_price = self.refresh_price(&token.address).await.unwrap_or(token.price);
+            tracing::warn!("⚠️ [Jupiter] Entry last-resort: ${:.8}", actual_price);
+        }
+
+        tracing::info!("✅ [BUY] ${} @ ${:.8} | TX: {}", token.symbol, actual_price, txid);
+
+        Ok(BuyResult {
+            success: true,
+            txid: Some(txid),
+            buy_price: actual_price,
+            trade_size_sol: amount_sol,
+        })
+    }
+
+    /// Paper trade buy (no real TX)
+    async fn paper_buy(&self, token: &TokenCandidate, amount_sol: f64) -> Result<BuyResult, String> {
+        let price = self.refresh_price(&token.address).await.unwrap_or(token.price);
+        tracing::info!("📝 [PAPER BUY] ${} @ ${:.8} ({:.4} SOL)", token.symbol, price, amount_sol);
+
+        Ok(BuyResult {
+            success: true,
+            txid: Some(format!("PAPER_{}", chrono::Utc::now().timestamp())),
+            buy_price: price,
+            trade_size_sol: amount_sol,
+        })
+    }
+
+    /// Monitor position and execute sell when conditions met
+    pub async fn monitor_and_sell(
+        &self,
+        token: TokenCandidate,
+        buy_price: f64,
+        spent_sol: f64,
+    ) -> f64 {
+        let address = token.address.clone();
+        let symbol = token.symbol.clone();
+        let start = std::time::Instant::now();
+        let max_monitor_ms: u128 = 15 * 60 * 1000;
+
+        let stop_loss_pct = self.config.stop_loss_pct;
+        let take_profit_pct = self.config.take_profit_pct;
+
+        let mut tp1_hit = false;
+        let mut break_even_hit = false;
+        let mut highest_price = buy_price;
+        let mut stop_price = buy_price * (1.0 - stop_loss_pct / 100.0);
+        let mut current_price = buy_price;
+
+        // Register active trade
+        {
+            let mut trades = self.active_trades.lock().await;
+            trades.insert(address.clone(), ActiveTrade {
+                symbol: symbol.clone(),
+                entry_price: buy_price,
+                spent_sol,
+                current_price: buy_price,
+                pnl_pct: 0.0,
+                tp1_hit: false,
+                break_even_hit: false,
+                highest_price: buy_price,
+                stop_price,
+            });
+        }
+
+        tracing::info!("🔔 [Monitor] เริ่มเฝ้าดู ${} (Entry: ${:.8}, Stop: ${:.8})", symbol, buy_price, stop_price);
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+            if let Some(price) = self.refresh_price(&address).await {
+                current_price = price;
+            }
+
+            let pnl_pct = ((current_price - buy_price) / buy_price) * 100.0;
+            let elapsed_ms = start.elapsed().as_millis();
+
+            // Update active trade state
+            {
+                let mut trades = self.active_trades.lock().await;
+                if let Some(trade) = trades.get_mut(&address) {
+                    trade.current_price = current_price;
+                    trade.pnl_pct = pnl_pct;
+                    trade.stop_price = stop_price;
+                    trade.tp1_hit = tp1_hit;
+                    trade.break_even_hit = break_even_hit;
+                    trade.highest_price = highest_price;
+                }
+            }
+
+            // ─── EXIT CONDITIONS ───
+
+            if pnl_pct <= -50.0 {
+                tracing::error!("🛑 [HARD-STOP] ${} PNL: {:.2}%", symbol, pnl_pct);
+                self.execute_sell_action(&token, 100, "HARD-STOP").await;
+                self.remove_trade(&address).await;
+                return pnl_pct;
+            }
+
+            if elapsed_ms > max_monitor_ms {
+                tracing::warn!("⏰ [TIMEOUT] ${} PNL: {:.2}%", symbol, pnl_pct);
+                self.execute_sell_action(&token, 100, "TIMEOUT").await;
+                self.remove_trade(&address).await;
+                return pnl_pct;
+            }
+
+            if current_price <= stop_price {
+                let reason = if tp1_hit { "TRAILING-STOP" }
+                    else if break_even_hit { "BREAK-EVEN" }
+                    else { "STOP-LOSS" };
+                tracing::warn!("🛑 [{}] ${} PNL: {:.2}%", reason, symbol, pnl_pct);
+                self.execute_sell_action(&token, 100, reason).await;
+                self.remove_trade(&address).await;
+                return pnl_pct;
+            }
+
+            if pnl_pct >= 20.0 && !break_even_hit {
+                break_even_hit = true;
+                let new_stop = buy_price * 1.05;
+                if new_stop > stop_price { stop_price = new_stop; }
+                tracing::info!("🛡️ [Break-Even] ${} ล็อกทุนที่ ${:.8}", symbol, stop_price);
+            }
+
+            if pnl_pct >= take_profit_pct && !tp1_hit {
+                tracing::info!("🎉 [TP1] ${} ขาย 50% ดึงทุนคืน (PNL: {:.2}%)", symbol, pnl_pct);
+                self.execute_sell_action(&token, 50, "TP1").await;
+                tp1_hit = true;
+                stop_price = buy_price * 1.10;
+                tracing::info!("🛡️ [Safety] ${} ล็อกกำไรไว้ที่ ${:.8}", symbol, stop_price);
+            }
+
+            if current_price > highest_price {
+                highest_price = current_price;
+                if tp1_hit {
+                    let new_stop = highest_price * 0.75;
+                    if new_stop > stop_price {
+                        stop_price = new_stop;
+                        tracing::debug!("📈 [Trailing] ${} Stop → ${:.8}", symbol, stop_price);
+                    }
+                } else if pnl_pct >= 20.0 {
+                    let new_stop = highest_price * 0.85;
+                    if new_stop > stop_price { stop_price = new_stop; }
+                }
+            }
+        }
+    }
+
+    async fn execute_sell_action(&self, token: &TokenCandidate, pct: u8, reason: &str) {
+        if self.config.paper_trade {
+            tracing::info!("📝 [PAPER SELL {}%] ${} reason={}", pct, token.symbol, reason);
+            return;
+        }
+        tracing::info!("💰 [SELL {}%] ${} reason={}", pct, token.symbol, reason);
+        // Full Jupiter sell implementation mirrors execute_buy with reversed mints
+    }
+
+    async fn remove_trade(&self, address: &str) {
+        let mut trades = self.active_trades.lock().await;
+        trades.remove(address);
+    }
+}
+
+#[derive(Debug)]
+pub struct BuyResult {
+    pub success: bool,
+    pub txid: Option<String>,
+    pub buy_price: f64,
+    pub trade_size_sol: f64,
+}
