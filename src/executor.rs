@@ -601,8 +601,15 @@ impl TradeExecutor {
         self.tui_state.log_trade(&format!("💰 [LIVE SELL {}%] ${} amount={} (Reason: {})", pct, token.symbol, sell_amount, reason));
 
         let client = reqwest::Client::new();
-        let quote_url = format!("{}/quote?inputMint={}&outputMint={}&amount={}&slippageBps={}",
-            self.jup_base, token.address, SOL_MINT, sell_amount, self.config.slippage_bps);
+        let quote_url = if self.config.use_ultra {
+            format!("{}/order?inputMint={}&outputMint={}&amount={}&slippageBps={}&taker={}&computeUnitPriceMicroLamports={}",
+                self.jup_base, token.address, SOL_MINT, sell_amount,
+                self.config.slippage_bps, wallet.pubkey(),
+                self.config.priority_fee_micro_lamports)
+        } else {
+            format!("{}/quote?inputMint={}&outputMint={}&amount={}&slippageBps={}",
+                self.jup_base, token.address, SOL_MINT, sell_amount, self.config.slippage_bps)
+        };
 
         let mut headers = reqwest::header::HeaderMap::new();
         if !self.config.jupiter_api_key.is_empty() {
@@ -611,49 +618,92 @@ impl TradeExecutor {
             }
         }
 
-        match client.get(&quote_url).headers(headers.clone()).send().await {
-            Ok(resp) => {
-                if let Ok(quote) = resp.json::<serde_json::Value>().await {
-                    let swap_body = serde_json::json!({
-                        "quoteResponse": quote,
-                        "userPublicKey": wallet.pubkey().to_string(),
-                        "wrapAndUnwrapSol": true,
-                        "prioritizationFeeLamports": (self.config.priority_fee_micro_lamports / 1000)
-                    });
-                    
-                    let swap_url = format!("{}/swap", self.jup_base);
-                    if let Ok(swap_resp) = client.post(&swap_url).headers(headers).json(&swap_body).send().await {
-                        if let Ok(json) = swap_resp.json::<serde_json::Value>().await {
-                            if let Some(swap_tx_base64) = json["swapTransaction"].as_str() {
-                                if let Ok(tx_bytes) = base64::engine::general_purpose::STANDARD.decode(swap_tx_base64) {
-                                    if let Ok(mut tx) = bincode::deserialize::<VersionedTransaction>(&tx_bytes) {
-                                        let message_bytes = tx.message.serialize();
-                                        let signature = wallet.sign_message(&message_bytes);
-                                        tx.signatures[0] = signature;
+        // Execute sell logic
+        async fn do_sell(
+            client: &reqwest::Client,
+            quote_url: &str,
+            headers: reqwest::header::HeaderMap,
+            jup_base: &str,
+            wallet: &solana_sdk::signature::Keypair,
+            config: &crate::config::Config,
+            write_rpc: &solana_client::rpc_client::RpcClient,
+        ) -> Result<String, String> {
+            let quote: serde_json::Value = client.get(quote_url)
+                .headers(headers.clone())
+                .send().await.map_err(|e| e.to_string())?
+                .json().await.map_err(|e| e.to_string())?;
 
-                                        let send_config = solana_client::rpc_config::RpcSendTransactionConfig {
-                                            skip_preflight: true,
-                                            max_retries: Some(2),
-                                            ..Default::default()
-                                        };
+            if quote.get("error").is_some() || quote.get("errorCode").is_some() {
+                return Err(format!("Quote error: {:?}", quote));
+            }
 
-                                        match self.write_rpc.send_transaction_with_config(&tx, send_config) {
-                                            Ok(sig) => {
-                                                self.tui_state.log_trade(&format!("✅ [SELL SUCCESS] ${} TX: {}", token.symbol, sig));
-                                            }
-                                            Err(e) => {
-                                                self.tui_state.log_trade(&format!("❌ [SELL ERROR] Send Failed: {}", e));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+            let swap_tx_base64 = if config.use_ultra {
+                quote["transaction"].as_str().ok_or("No transaction in Ultra quote")?.to_string()
+            } else {
+                let swap_body = serde_json::json!({
+                    "quoteResponse": quote,
+                    "userPublicKey": wallet.pubkey().to_string(),
+                    "wrapAndUnwrapSol": true,
+                    "prioritizationFeeLamports": (config.priority_fee_micro_lamports / 1000)
+                });
+                let swap_url = format!("{}/swap", jup_base);
+                let swap_resp: serde_json::Value = client.post(&swap_url)
+                    .headers(headers.clone())
+                    .json(&swap_body)
+                    .send().await.map_err(|e| e.to_string())?
+                    .json().await.map_err(|e| e.to_string())?;
+                swap_resp["swapTransaction"].as_str()
+                    .ok_or("No swapTransaction in response")?.to_string()
+            };
+
+            use base64::Engine;
+            let tx_bytes = base64::engine::general_purpose::STANDARD
+                .decode(&swap_tx_base64).map_err(|e| e.to_string())?;
+            let mut tx: solana_sdk::transaction::VersionedTransaction = bincode::deserialize(&tx_bytes)
+                .map_err(|e| e.to_string())?;
+            let message_bytes = tx.message.serialize();
+            use solana_sdk::signer::Signer;
+            let signature = wallet.sign_message(&message_bytes);
+            tx.signatures[0] = signature;
+
+            let txid = if config.use_ultra {
+                let signed_b64 = base64::engine::general_purpose::STANDARD
+                    .encode(bincode::serialize(&tx).map_err(|e| e.to_string())?);
+                let request_id = quote["requestId"].as_str().unwrap_or("");
+                let exec_body = serde_json::json!({
+                    "requestId": request_id,
+                    "signedTransaction": signed_b64
+                });
+                let exec_url = format!("{}/execute", jup_base);
+                let exec_resp: serde_json::Value = client.post(&exec_url)
+                    .headers(headers)
+                    .json(&exec_body)
+                    .send().await.map_err(|e| e.to_string())?
+                    .json().await.map_err(|e| e.to_string())?;
+                exec_resp["signature"].as_str()
+                    .or(exec_resp["txid"].as_str())
+                    .ok_or("No txid from Jupiter Ultra")?
+                    .to_string()
+            } else {
+                let send_config = solana_client::rpc_config::RpcSendTransactionConfig {
+                    skip_preflight: true,
+                    max_retries: Some(2),
+                    ..Default::default()
+                };
+                let sig = write_rpc.send_transaction_with_config(&tx, send_config)
+                    .map_err(|e| e.to_string())?;
+                sig.to_string()
+            };
+            
+            Ok(txid)
+        }
+
+        match do_sell(&client, &quote_url, headers, &self.jup_base, wallet, &self.config, &self.write_rpc).await {
+            Ok(txid) => {
+                self.tui_state.log_trade(&format!("✅ [SELL SUCCESS] ${} TX: {}", token.symbol, txid));
             }
             Err(e) => {
-                self.tui_state.log_trade(&format!("❌ [SELL ERROR] Quote Failed: {}", e));
+                self.tui_state.log_trade(&format!("❌ [SELL ERROR] {}", e));
             }
         }
     }
