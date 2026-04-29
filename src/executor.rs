@@ -641,10 +641,19 @@ impl TradeExecutor {
             config: &crate::config::Config,
             write_rpc: &solana_client::rpc_client::RpcClient,
         ) -> Result<String, String> {
-            let quote: serde_json::Value = client.get(quote_url)
+            let quote_resp = client.get(quote_url)
+                .header("Accept", "application/json")
                 .headers(headers.clone())
-                .send().await.map_err(|e| e.to_string())?
-                .json().await.map_err(|e| e.to_string())?;
+                .send().await.map_err(|e| format!("Sell quote request failed: {}", e))?;
+
+            let status = quote_resp.status();
+            if !status.is_success() {
+                let err_text = quote_resp.text().await.unwrap_or_default();
+                return Err(format!("Sell Quote HTTP {}: {}", status, err_text));
+            }
+
+            let quote: serde_json::Value = quote_resp.json().await
+                .map_err(|e| format!("Sell quote JSON decode: {}", e))?;
 
             if quote.get("error").is_some() || quote.get("errorCode").is_some() {
                 return Err(format!("Quote error: {:?}", quote));
@@ -657,23 +666,32 @@ impl TradeExecutor {
                     "quoteResponse": quote,
                     "userPublicKey": wallet.pubkey().to_string(),
                     "wrapAndUnwrapSol": true,
-                    "prioritizationFeeLamports": (config.priority_fee_micro_lamports / 1000)
+                    "prioritizationFeeLamports": config.priority_fee_micro_lamports
                 });
                 let swap_url = format!("{}/swap", jup_base);
-                let swap_resp: serde_json::Value = client.post(&swap_url)
+                let swap_resp_raw = client.post(&swap_url)
+                    .header("Content-Type", "application/json")
                     .headers(headers.clone())
                     .json(&swap_body)
-                    .send().await.map_err(|e| e.to_string())?
-                    .json().await.map_err(|e| e.to_string())?;
+                    .send().await.map_err(|e| format!("Sell swap request failed: {}", e))?;
+
+                let swap_status = swap_resp_raw.status();
+                if !swap_status.is_success() {
+                    let err_text = swap_resp_raw.text().await.unwrap_or_default();
+                    return Err(format!("Sell Swap HTTP {}: {}", swap_status, err_text));
+                }
+
+                let swap_resp: serde_json::Value = swap_resp_raw.json().await
+                    .map_err(|e| format!("Sell swap JSON decode: {}", e))?;
                 swap_resp["swapTransaction"].as_str()
                     .ok_or("No swapTransaction in response")?.to_string()
             };
 
             use base64::Engine;
             let tx_bytes = base64::engine::general_purpose::STANDARD
-                .decode(&swap_tx_base64).map_err(|e| e.to_string())?;
+                .decode(&swap_tx_base64).map_err(|e| format!("Base64 decode: {}", e))?;
             let mut tx: solana_sdk::transaction::VersionedTransaction = bincode::deserialize(&tx_bytes)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("TX deserialize: {}", e))?;
             let message_bytes = tx.message.serialize();
             use solana_sdk::signer::Signer;
             let signature = wallet.sign_message(&message_bytes);
@@ -681,18 +699,26 @@ impl TradeExecutor {
 
             let txid = if config.use_ultra {
                 let signed_b64 = base64::engine::general_purpose::STANDARD
-                    .encode(bincode::serialize(&tx).map_err(|e| e.to_string())?);
+                    .encode(bincode::serialize(&tx).map_err(|e| format!("TX serialize: {}", e))?);
                 let request_id = quote["requestId"].as_str().unwrap_or("");
                 let exec_body = serde_json::json!({
                     "requestId": request_id,
                     "signedTransaction": signed_b64
                 });
                 let exec_url = format!("{}/execute", jup_base);
-                let exec_resp: serde_json::Value = client.post(&exec_url)
+                let exec_resp_raw = client.post(&exec_url)
                     .headers(headers)
                     .json(&exec_body)
-                    .send().await.map_err(|e| e.to_string())?
-                    .json().await.map_err(|e| e.to_string())?;
+                    .send().await.map_err(|e| format!("Ultra execute request: {}", e))?;
+
+                let exec_status = exec_resp_raw.status();
+                if !exec_status.is_success() {
+                    let err_text = exec_resp_raw.text().await.unwrap_or_default();
+                    return Err(format!("Ultra Execute HTTP {}: {}", exec_status, err_text));
+                }
+
+                let exec_resp: serde_json::Value = exec_resp_raw.json().await
+                    .map_err(|e| format!("Ultra execute JSON decode: {}", e))?;
                 exec_resp["signature"].as_str()
                     .or(exec_resp["txid"].as_str())
                     .ok_or("No txid from Jupiter Ultra")?
@@ -704,7 +730,7 @@ impl TradeExecutor {
                     ..Default::default()
                 };
                 let sig = write_rpc.send_transaction_with_config(&tx, send_config)
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| format!("RPC send: {}", e))?;
                 sig.to_string()
             };
             
