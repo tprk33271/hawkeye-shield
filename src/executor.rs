@@ -426,6 +426,7 @@ impl TradeExecutor {
         let _ = self.ws_cmd_tx.send(WsCommand::SubscribePrice(address.clone())).await;
 
         let jup_client = reqwest::Client::new();
+        let mut time_since_last_birdeye = std::time::Instant::now();
 
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -438,11 +439,27 @@ impl TradeExecutor {
                 }
             }
 
-            // Fallback: Ping Jupiter Price API (100% Free, 0 CU)
+            let mut got_price_from_jupiter = false;
+
+            // Fallback 1: Ping Jupiter Price API (100% Free, 0 CU)
             if let Ok(resp) = jup_client.get(format!("https://api.jup.ag/price/v2?ids={}", address)).send().await {
                 if let Ok(body) = resp.json::<serde_json::Value>().await {
                     if let Some(p) = body["data"][&address]["price"].as_str().and_then(|p| p.parse::<f64>().ok()) {
-                        if p > 0.0 { current_price = p; }
+                        if p > 0.0 { 
+                            current_price = p; 
+                            got_price_from_jupiter = true;
+                        }
+                    }
+                }
+            }
+
+            // Fallback 2: Throttled Birdeye REST API (Because Pump.fun tokens often aren't on Jupiter yet)
+            // Throttled to once every 5 seconds to prevent CU burn (12 calls/min = 60 CU/min)
+            if !got_price_from_jupiter && time_since_last_birdeye.elapsed().as_secs() >= 5 {
+                if let Ok(price) = self.birdeye.get_price(&address).await {
+                    if price > 0.0 {
+                        current_price = price;
+                        time_since_last_birdeye = std::time::Instant::now();
                     }
                 }
             }
