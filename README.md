@@ -11,10 +11,10 @@
 ---
 
 ## 🎬 Live Demonstration
-https://github.com/user-attachments/assets/15b5cd93-cc4c-4731-bb66-cfb8f2c256cc
 
-> **[Watch the 30-Second Live Action Demo](./assets/demo.mov)** 
-*(If the preview doesn't load, click the link above to view the raw .MOV file)*
+https://github.com/tprk33271/hawkeye-shield/raw/main/assets/demo.mp4
+
+> **[Watch the 30-Second Live Action Demo](./assets/demo.mp4)**
 
 ---
 
@@ -152,7 +152,7 @@ hawkeye-shield/
 │   ├── websocket.rs    # Birdeye Native SUBSCRIBE_MEME implementation
 │   └── logger.rs       # Output formatting and trade result logging
 └── assets/
-    └── demo.mov        # Video demonstration
+    └── demo.mp4        # Video demonstration
 ```
 
 ---
