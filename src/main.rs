@@ -59,15 +59,15 @@ async fn main() {
     let (ws_tx, mut ws_rx) = mpsc::channel::<WsEvent>(100);
 
     // Start WebSocket in background
-    let ws_rpc = config.solana_rpc_url.clone();
+    let api_key = config.birdeye_api_key.clone();
     tokio::spawn(async move {
-        start_websocket(&ws_rpc, ws_tx).await;
+        start_websocket(&api_key, ws_tx).await;
     });
 
     let max_trades = config.max_active_trades;
-    let mut scan_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+    let mut scan_interval = tokio::time::interval(std::time::Duration::from_secs(45));
 
-    tui_state.log_scanner("🚀 HawkEye Shield Started! (WebSocket + Polling every 15s)");
+    tui_state.log_scanner("🚀 HawkEye Shield Started! (WebSocket + Polling every 45s)");
 
     loop {
         tokio::select! {
@@ -76,22 +76,12 @@ async fn main() {
                 if active_count >= max_trades { continue; }
 
                 match event {
-                    WsEvent::NewPairRaydium(sig) => {
-                        if let Some(mint) = executor.fetch_mint_from_sig(&sig, crate::executor::NewPairType::Raydium).await {
-                            tui_state.log_scanner(&format!("🔔 [WS] New Raydium Pool: {}", mint));
-                            let mut buffer = scanner.ws_buffer.lock().await;
-                            if !buffer.contains(&mint) {
-                                buffer.push(mint);
-                            }
-                        }
-                    }
-                    WsEvent::NewPairPumpFun(sig) => {
-                        if let Some(mint) = executor.fetch_mint_from_sig(&sig, crate::executor::NewPairType::PumpFun).await {
-                            tui_state.log_scanner(&format!("💊 [WS] New Pump.fun: {}", mint));
-                            let mut buffer = scanner.ws_buffer.lock().await;
-                            if !buffer.contains(&mint) {
-                                buffer.push(mint);
-                            }
+                    WsEvent::EnrichedMeme(data) => {
+                        tui_state.log_scanner(&format!("🔔 [WS] Enriched Token: {} (${})", data.symbol, data.address));
+                        let mut buffer = scanner.ws_buffer.lock().await;
+                        // Avoid duplicates in buffer
+                        if !buffer.iter().any(|d| d.address == data.address) {
+                            buffer.push(data);
                         }
                     }
                 }

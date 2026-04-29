@@ -6,6 +6,7 @@ use std::io::Write;
 // Logger — Trade Result Logging
 // ============================================================
 
+#[allow(dead_code)]
 pub fn log_trade_result(
     symbol: &str,
     entry_price: f64,

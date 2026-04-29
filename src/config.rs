@@ -12,6 +12,8 @@ pub struct Config {
     pub wallet: Option<Arc<Keypair>>,
     // Trading
     pub trade_size_sol: f64,
+    pub use_dynamic_sizing: bool,
+    pub kelly_fraction: f64,
     pub take_profit_pct: f64,
     pub stop_loss_pct: f64,
     pub slippage_bps: u64,
@@ -35,13 +37,13 @@ impl Config {
                     match Keypair::try_from(bytes.as_slice()) {
                         Ok(kp) => Some(Arc::new(kp)),
                         Err(_) => {
-                            tracing::error!("❌ SOLANA_PRIVATE_KEY format ไม่ถูกต้อง");
+                            tracing::error!("❌ Invalid SOLANA_PRIVATE_KEY format");
                             None
                         }
                     }
                 }
                 Err(_) => {
-                    tracing::error!("❌ SOLANA_PRIVATE_KEY ไม่ใช่ Base58 ที่ถูกต้อง");
+                    tracing::error!("❌ SOLANA_PRIVATE_KEY is not valid Base58");
                     None
                 }
             }
@@ -59,6 +61,10 @@ impl Config {
             wallet,
             trade_size_sol: env::var("TRADE_SIZE_SOL")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(0.05),
+            use_dynamic_sizing: env::var("USE_DYNAMIC_SIZING")
+                .map(|v| v == "true").unwrap_or(true),
+            kelly_fraction: env::var("KELLY_FRACTION")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0.15),
             take_profit_pct: env::var("TAKE_PROFIT_PERCENT")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(40.0),
             stop_loss_pct: env::var("STOP_LOSS_PERCENT")
@@ -78,6 +84,7 @@ impl Config {
         }
     }
 
+    #[allow(dead_code)]
     pub fn wallet_pubkey_str(&self) -> String {
         self.wallet.as_ref()
             .map(|k| k.pubkey().to_string())

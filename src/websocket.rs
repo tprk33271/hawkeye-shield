@@ -1,91 +1,91 @@
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use serde::{Deserialize, Serialize};
 
 // ============================================================
-// WebSocket — Real-time New Pair Detection (Raydium + PumpFun)
+// WebSocket — Birdeye Native Real-time Meme Data
 // ============================================================
 
-const RAYDIUM_PROGRAM: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
-const PUMP_FUN_PROGRAM: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
-
-pub enum WsEvent {
-    NewPairRaydium(String),
-    NewPairPumpFun(String),
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemeData {
+    pub address: String,
+    pub name: String,
+    pub symbol: String,
+    pub price: f64,
+    pub liquidity: f64,
+    pub market_cap: f64,
+    pub fdv: Option<f64>,
+    pub meme_info: MemeInfo,
 }
 
-pub async fn start_websocket(rpc_url: &str, tx: mpsc::Sender<WsEvent>) {
-    let ws_url = rpc_url.replace("https", "wss");
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemeInfo {
+    pub source: String,
+    pub progress_percent: f64,
+    pub graduated: bool,
+    pub creation_time: u64,
+    pub creator: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum BirdeyeEvent {
+    #[serde(rename = "MEME_DATA")]
+    MemeData { data: MemeData },
+    #[serde(other)]
+    Unknown,
+}
+
+pub enum WsEvent {
+    EnrichedMeme(MemeData),
+}
+
+pub async fn start_websocket(api_key: &str, tx: mpsc::Sender<WsEvent>) {
+    let ws_url = format!("wss://public-api.birdeye.so/socket/solana?x-api-key={}", api_key);
 
     loop {
-        tracing::info!("📡 [WebSocket] กำลังเชื่อมต่อ {}...", ws_url);
+        tracing::info!("📡 [WebSocket] Connecting to Birdeye WS...");
 
         match connect_async(&ws_url).await {
             Ok((ws_stream, _)) => {
-                tracing::info!("✅ [WebSocket] เชื่อมต่อสำเร็จ!");
+                tracing::info!("✅ [WebSocket] Connected to Birdeye successfully!");
                 let (mut write, mut read) = ws_stream.split();
 
                 use futures_util::SinkExt;
 
-                // Subscribe to Raydium logs
-                let raydium_sub = serde_json::json!({
-                    "jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
-                    "params": [
-                        { "mentions": [RAYDIUM_PROGRAM] },
-                        { "commitment": "processed" }
-                    ]
+                // Subscribe to Pump.fun tokens with > 50% progress
+                let subscribe_msg = serde_json::json!({
+                    "type": "SUBSCRIBE_MEME",
+                    "data": {
+                        "source": "pump_dot_fun",
+                        "progress_percent": {
+                            "min": 50,
+                            "max": 100
+                        }
+                    }
                 });
-                let _ = write.send(Message::Text(raydium_sub.to_string().into())).await;
 
-                // Subscribe to PumpFun logs
-                let pump_sub = serde_json::json!({
-                    "jsonrpc": "2.0", "id": 2, "method": "logsSubscribe",
-                    "params": [
-                        { "mentions": [PUMP_FUN_PROGRAM] },
-                        { "commitment": "processed" }
-                    ]
-                });
-                let _ = write.send(Message::Text(pump_sub.to_string().into())).await;
-
-                let tx_clone = tx.clone();
+                if let Err(e) = write.send(Message::Text(subscribe_msg.to_string().into())).await {
+                    tracing::error!("❌ [WebSocket] Subscription failed: {}", e);
+                    continue;
+                }
 
                 while let Some(msg) = read.next().await {
                     match msg {
                         Ok(Message::Text(text)) => {
-                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                                if json["method"] == "logsNotification" {
-                                    let logs = json["params"]["result"]["value"]["logs"]
-                                        .as_array();
-                                    let signature = json["params"]["result"]["value"]["signature"]
-                                        .as_str().unwrap_or("").to_string();
-
-                                    if let Some(logs) = logs {
-                                        let log_strs: Vec<&str> = logs.iter()
-                                            .filter_map(|l| l.as_str())
-                                            .collect();
-
-                                        let is_raydium_new = log_strs.iter().any(|l|
-                                            l.contains("InitializeInstruction2") ||
-                                            l.contains("InitializeInstruction"));
-                                        if is_raydium_new && !signature.is_empty() {
-                                            tracing::info!("🔔 [WS-Raydium] พบ Pool ใหม่: {}...",
-                                                &signature[..signature.len().min(8)]);
-                                            let _ = tx_clone.send(WsEvent::NewPairRaydium(signature.clone())).await;
-                                        }
-
-                                        let is_pump_new = log_strs.iter().any(|l|
-                                            l.contains("Program log: Instruction: Create"));
-                                        if is_pump_new && !signature.is_empty() {
-                                            tracing::info!("💊 [WS-PumpFun] พบเหรียญใหม่: {}...",
-                                                &signature[..signature.len().min(8)]);
-                                            let _ = tx_clone.send(WsEvent::NewPairPumpFun(signature.clone())).await;
-                                        }
+                            if let Ok(event) = serde_json::from_str::<BirdeyeEvent>(&text) {
+                                match event {
+                                    BirdeyeEvent::MemeData { data } => {
+                                        tracing::info!("🔔 [WS] Enriched Token Data for ${} ({})", data.symbol, data.address);
+                                        let _ = tx.send(WsEvent::EnrichedMeme(data)).await;
                                     }
+                                    _ => {}
                                 }
                             }
                         }
-                        Err(e) => {
-                            tracing::warn!("⚠️ [WebSocket] Error: {}", e);
+                        Ok(Message::Close(_)) | Err(_) => {
+                            tracing::warn!("⚠️ [WebSocket] Connection closed or error occurred.");
                             break;
                         }
                         _ => {}
@@ -93,7 +93,7 @@ pub async fn start_websocket(rpc_url: &str, tx: mpsc::Sender<WsEvent>) {
                 }
             }
             Err(e) => {
-                tracing::error!("❌ [WebSocket] Connection failed: {}", e);
+                tracing::error!("❌ [WebSocket] Birdeye WS connection failed: {}", e);
             }
         }
 
@@ -101,3 +101,4 @@ pub async fn start_websocket(rpc_url: &str, tx: mpsc::Sender<WsEvent>) {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
 }
+

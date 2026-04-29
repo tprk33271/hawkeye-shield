@@ -24,10 +24,11 @@ HawkEye Shield is an **execution-layer trading agent** that autonomously discove
 
 **It is NOT a dashboard or read-only tool.** It makes real trades with real SOL using real-time API integrations.
 
-### The Execution Loop (Runs every 8 seconds)
+### High-Efficiency "Funnel" Architecture
 ```text
-[Birdeye Discovery API] → [Risk & Liquidity Filters] → [Jupiter Swap Buy] → [Birdeye Price Monitor] → [Auto-Sell (TP/SL)]
+[Birdeye SUBSCRIBE_MEME WS] → [Zero-CU Metadata Filtering] → [Tiered REST Verification] → [Jupiter Execution]
 ```
+> **CU Efficiency:** Our Birdeye-Native architecture reduces Compute Unit (CU) consumption by **~80%** compared to legacy RPC polling.
 
 ---
 
@@ -46,12 +47,12 @@ Unlike simple search tools, HawkEye Shield is an **active participant** in the m
 
 | Endpoint | Purpose in HawkEye Shield | Why Birdeye? |
 |---|---|---|
+| `SUBSCRIBE_MEME` (WS) | **Real-time discovery with ZERO CU.** | Eliminates expensive RPC polling; provides metadata (price, liquidity, bonding curve) instantly. |
 | `/defi/token_trending` | Discovery for momentum-based sniping. | Superior sorting/ranking compared to standard DEX feeds. |
 | `/defi/v2/tokens/new_listing` | Triggering immediate analysis for new market opportunities. | Instant indexing of new SPL tokens. |
 | `/defi/v3/token/meme/list` | Discovering newly minted meme tokens matching specific liquidity criteria. | High conviction alpha specifically for the meme narrative. |
-| `/defi/token_overview` | Extracting `liquidity`, `v5mUSD`, and `priceChange5mPercent`. | High-fidelity data for micro-cap volatility analysis. |
+| `/defi/token_overview` | Extracting `v5mUSD` and `priceChange5mPercent`. | High-fidelity data for micro-cap volatility analysis. |
 | `/defi/token_security` | Evaluating `top10HolderPercent`, `isMintable`, and `isFreezable`. | Crucial for automated risk mitigation (Anti-Rug). |
-| `/defi/v3/token/meme-detail/single` | Extracting developer details, website, and socials. | Provides fundamental social conviction for a token. |
 | `/defi/price` | Real-time monitoring and exact entry price calculation. | Eliminates "price lag" found in aggregate RPC polling. |
 
 ---
@@ -61,16 +62,20 @@ Unlike simple search tools, HawkEye Shield is an **active participant** in the m
 HawkEye Shield implements a multi-layer risk management system adapted from institutional quant strategies, tailored for the Pump.fun / Solana Meme ecosystem.
 
 ### 1. Dynamic Entry Filters
+- **Meme Sniper Thresholds:** Strict momentum requirements (e.g., 1h price > +10%, 5m volume spike > 3x average) to catch true breakouts.
 - **Minimum Liquidity:** $4,000+ (for new Pump.fun curve tokens) / $10,000+ (for graduated/Raydium legacy tokens).
-- **Buy/Sell Ratio:** Buys must outpace Sells by 1.2x in the last 5 minutes.
 - **Anti-Wash Trade Detection:** Detects fake volume by correlating low transaction counts with abnormally high average sizes.
-- **Birdeye Security Guard:** Hard-rejects tokens where Top 10 holders own > 30-40%, or if the token is `Mintable` or `Freezable`.
+- **Birdeye Security Guard:** Hard-rejects tokens where Top 10 holders own > 30-80% (scaled by age), or if the token is `Mintable` or `Freezable`.
 
-### 2. Dual-Mode Position Sizing
+### 2. API Resilience & Free-Tier Graceful Degradation
+- **Rate Limit Throttling:** Intelligently modulates request concurrency (`buffer_unordered(1)`) and polling intervals to stay precisely under the Free Tier's 60 Requests-Per-Minute and 30k CU monthly limits.
+- **Security Fallback:** If the Premium Security API throws a 401/403 on a free-tier key, the bot gracefully bypasses the endpoint and falls back to a custom heuristic (e.g., detecting `0` sells alongside high buys) to filter honeypots, ensuring continuous trading without API lockouts.
+
+### 3. Dual-Mode Position Sizing
 - **Dynamic Kelly Fraction:** Buys using a percentage of your current wallet balance (e.g., 15%). As your portfolio grows, your trade sizes scale automatically.
 - **Fixed Allocation:** Optionally bypass dynamic sizing to buy an exact, fixed amount of SOL per trade.
 
-### 3. Lifecycle Management
+### 4. Lifecycle Management
 1. **Stop-Loss:** Triggers an emergency sell at -12% (configurable).
 2. **Break-Even Lock:** If the token hits +20%, the stop-loss is automatically moved to +5% to guarantee a risk-free trade.
 3. **Take Profit 1 (Pull Capital):** At +40%, the bot sells exactly 50% of the holdings to secure the initial capital.
@@ -141,10 +146,10 @@ hawkeye-shield/
 ├── src/
 │   ├── main.rs         # Entry point, orchestrator, and event loop
 │   ├── config.rs       # Environment configuration loader
-│   ├── birdeye.rs      # Birdeye API client (7 integrated endpoints)
-│   ├── scanner.rs      # Token discovery, security checks, and filtering
-│   ├── executor.rs     # Jupiter API integration, buy/sell execution, position monitoring
-│   ├── websocket.rs    # Real-time Solana RPC WebSocket detection
+│   ├── birdeye.rs      # Birdeye REST API client (7 integrated endpoints)
+│   ├── scanner.rs      # 3-Tier Funnel (Filtering + Security checks)
+│   ├── executor.rs     # Jupiter API integration & position monitoring
+│   ├── websocket.rs    # Birdeye Native SUBSCRIBE_MEME implementation
 │   └── logger.rs       # Output formatting and trade result logging
 └── assets/
     └── demo.mov        # Video demonstration

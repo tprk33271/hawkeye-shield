@@ -5,6 +5,13 @@ use std::time::Instant;
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 
+fn debug_log(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/hawkeye_debug.log") {
+        let _ = writeln!(f, "{}", msg);
+    }
+}
+
 // ============================================================
 // Scanner — Token Discovery + Filtering Engine
 // Port of scanner.js with Birdeye as sole data source
@@ -30,7 +37,7 @@ pub struct Scanner {
     safety_blacklist: HashMap<String, Instant>,   // blacklist 1 hour
     trade_blacklist: HashMap<String, (u32, Instant)>, // (loss_count, release_at)
     tui_state: Arc<crate::tui::TuiState>,
-    pub ws_buffer: Arc<TokioMutex<Vec<String>>>,
+    pub ws_buffer: Arc<TokioMutex<Vec<crate::websocket::MemeData>>>,
 }
 
 impl Scanner {
@@ -74,7 +81,7 @@ impl Scanner {
         let trending = match self.birdeye.get_trending().await {
             Ok(data) => data,
             Err(e) => {
-                eprintln!("API_ERROR_TRENDING: {}", e);
+                debug_log(&format!("API_ERROR_TRENDING: {}", e));
                 self.tui_state.log_scanner(&format!("❌ [Scanner] Error fetching trending: {}", e));
                 vec![]
             }
@@ -83,7 +90,7 @@ impl Scanner {
         let new_listings = match self.birdeye.get_new_listings().await {
             Ok(data) => data,
             Err(e) => {
-                eprintln!("API_ERROR_NEW: {}", e);
+                debug_log(&format!("API_ERROR_NEW: {}", e));
                 self.tui_state.log_scanner(&format!("❌ [Scanner] Error fetching new listings: {}", e));
                 vec![]
             }
@@ -99,29 +106,27 @@ impl Scanner {
 
         let mut addresses: Vec<String> = Vec::new();
         
-        // Take from WebSocket buffer - REAL TIME SIGNALS
+        let mut ws_candidates: Vec<crate::websocket::MemeData> = Vec::new();
         {
             let mut buffer = self.ws_buffer.lock().await;
-            for addr in buffer.iter() {
-                if !addresses.contains(addr) { addresses.push(addr.clone()); }
-            }
-            buffer.clear(); // Clear after processing
+            ws_candidates.extend(buffer.clone());
+            buffer.clear();
         }
 
         // Take top from trending - FILTER EARLY to save CU
-        for t in trending.iter().take(10) {
+        for t in trending.iter().take(4) {
             if t.liquidity.unwrap_or(0.0) < 3000.0 { continue; } // Skip dead ones immediately
             if !addresses.contains(&t.address) { addresses.push(t.address.clone()); }
         }
         
         // Take top from new listings - FILTER EARLY
-        for n in new_listings.iter().take(10) {
+        for n in new_listings.iter().take(4) {
             if n.liquidity.unwrap_or(0.0) < 2000.0 { continue; }
             if !addresses.contains(&n.address) { addresses.push(n.address.clone()); }
         }
 
         // Take top from Meme List V3
-        for m in meme_list.iter().take(5) {
+        for m in meme_list.iter().take(3) {
             if !addresses.contains(&m.address) { addresses.push(m.address.clone()); }
         }
 
@@ -129,166 +134,226 @@ impl Scanner {
             trending.len(), new_listings.len(), meme_list.len()));
 
         let mut addresses_to_scan = Vec::new();
-        for address in addresses.iter() {
-            // Skip if already holding
-            if exclude_addresses.contains(address) { continue; }
-            // Skip if trade-blacklisted
-            if self.trade_blacklist.contains_key(address) { continue; }
-            // Skip if safety-blacklisted
-            if self.safety_blacklist.contains_key(address) { continue; }
-            // Skip if recently scanned (2 min cooldown)
-            if let Some(t) = self.scanned_cache.get(address) {
+        // Tokens from WebSocket already have some data, we prioritize them
+        let mut enriched_ws_to_scan = Vec::new();
+
+        for data in ws_candidates {
+            let address = data.address.clone();
+            if exclude_addresses.contains(&address) || self.trade_blacklist.contains_key(&address) || 
+               self.safety_blacklist.contains_key(&address) { continue; }
+            
+            if let Some(t) = self.scanned_cache.get(&address) {
                 if now.duration_since(*t).as_secs() < 120 { continue; }
             }
-
-            self.scanned_cache.insert(address.clone(), now);
-            addresses_to_scan.push(address.clone());
             
-            // Safety cap: Never scan more than 15 tokens per cycle to respect CU limits
-            if addresses_to_scan.len() >= 15 { break; }
+            self.scanned_cache.insert(address.clone(), now);
+            enriched_ws_to_scan.push(data);
+            if (enriched_ws_to_scan.len() + addresses_to_scan.len()) >= 8 { break; }
+        }
+
+        if (enriched_ws_to_scan.len() + addresses_to_scan.len()) < 8 {
+            for address in addresses.iter() {
+                if exclude_addresses.contains(address) || self.trade_blacklist.contains_key(address) || 
+                   self.safety_blacklist.contains_key(address) { continue; }
+                
+                if let Some(t) = self.scanned_cache.get(address) {
+                    if now.duration_since(*t).as_secs() < 120 { continue; }
+                }
+                
+                // Avoid duplicates already in enriched_ws_to_scan
+                if enriched_ws_to_scan.iter().any(|d| &d.address == address) { continue; }
+
+                self.scanned_cache.insert(address.clone(), now);
+                addresses_to_scan.push(address.clone());
+                
+                if (enriched_ws_to_scan.len() + addresses_to_scan.len()) >= 8 { break; }
+            }
         }
 
         use futures_util::stream::{self, StreamExt};
 
-        let mut stream = stream::iter(addresses_to_scan).map(|address| {
+        enum ScanJob {
+            Enriched(crate::websocket::MemeData),
+            Address(String),
+        }
+
+        let mut jobs = Vec::new();
+        for d in enriched_ws_to_scan { jobs.push(ScanJob::Enriched(d)); }
+        for a in addresses_to_scan { jobs.push(ScanJob::Address(a)); }
+
+        let mut combined_stream = stream::iter(jobs).map(|job| {
             let birdeye = self.birdeye.clone();
-            let trending = trending.clone();
             let paper_trade = self.config.paper_trade;
             let tui_state = self.tui_state.clone();
-            
+            let trending = trending.clone();
+
             async move {
-                // Add a small delay to avoid hitting rate limit burst (max 5 requests per second)
-                // Sequential processing with 1.2s delay to keep CU usage low and steady
-                tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-
-                // Fetch detailed data from Birdeye
-                let mut overview = match birdeye.get_token_overview(&address).await {
-                    Ok(o) => o,
-                    Err(e) => {
-                        tui_state.log_scanner(&format!("  ❌ {} skip: Overview Error: {}", address, e));
-                        return (None, None);
-                    }
-                };
-
-                // Enrich with Trending API data
-                if let Some(t) = trending.iter().find(|t| &t.address == &address) {
-                    if overview.market_cap <= 0.0 {
-                        overview.market_cap = t.volume_24h.unwrap_or(0.0); // fallback estimate
-                    }
-                    if overview.liquidity <= 0.0 {
-                        overview.liquidity = t.liquidity.unwrap_or(0.0);
-                    }
-                    if overview.volume_24h <= 0.0 {
-                        overview.volume_24h = t.volume_24h.unwrap_or(0.0);
-                    }
-                    if overview.price <= 0.0 {
-                        overview.price = t.price.unwrap_or(0.0);
-                    }
-                }
-
-                // ─── FILTERING LOGIC (ported from scanner.js) ───
-                let age_minutes = overview.created_at
-                    .map(|ts| (chrono::Utc::now().timestamp() - ts) as f64 / 60.0)
-                    .unwrap_or(0.0);
-
-                let m5_buys = overview.buy_5m;
-                let m5_sells = overview.sell_5m;
-                let m5_volume = overview.volume_5m;
-                let liquidity = overview.liquidity;
-                let price_change_m5 = overview.price_change_5m;
-
-                // Anti-Wash Trade
-                let avg_buy_size = if m5_buys > 0 { m5_volume / m5_buys as f64 } else { 0.0 };
-                if m5_buys < 30 && avg_buy_size > 500.0 {
-                    return (None, None);
-                }
-
-                // ═══ HARD FILTERS (don't rely on Security API) ═══
-                if liquidity < 4000.0 {
-                    tui_state.log_scanner(&format!("  🛑 ${} skip: Low Liquidity (${:.0})", overview.symbol, liquidity));
-                    return (None, None);
-                }
-
-                if m5_buys < 5 {
-                    tui_state.log_scanner(&format!("  🛑 ${} skip: No buyers ({})", overview.symbol, m5_buys));
-                    return (None, None);
-                }
-
-                if overview.volume_24h < 3000.0 {
-                    tui_state.log_scanner(&format!("  🛑 ${} skip: Dead volume (24h: ${:.0})", overview.symbol, overview.volume_24h));
-                    return (None, None);
-                }
-
-                // ═══ MOMENTUM CHECK (same for Paper + Live) ═══
-                let is_healthy_momentum = m5_buys > (m5_sells as f64 * 1.2) as u64 && m5_volume > 500.0;
-
-                // Strategy matching
-                let strategy = Scanner::match_strategy_static(
-                    paper_trade, age_minutes, is_healthy_momentum, liquidity,
-                    price_change_m5, m5_volume, &overview
-                );
-
-                let strategy = match strategy {
-                    Some(s) => s,
-                    None => {
-                        if paper_trade {
-                            let reason = if !is_healthy_momentum { "Low Momentum" } else { "No Strategy Fit" };
-                            tui_state.log_scanner(&format!("  ℹ️ Skipping ${}: {} (M5 Chg: {:.1}%, Vol: ${:.0})", 
-                                overview.symbol, reason, price_change_m5, m5_volume));
+                match job {
+                    ScanJob::Enriched(data) => {
+                        let address = data.address.clone();
+                        // Tier 2: Pre-filter based on WS data (ZERO CU)
+                        if data.liquidity < 3500.0 {
+                            debug_log(&format!("REJECT_WS {} Low liq: ${:.0}", address, data.liquidity));
+                            tui_state.log_scanner(&format!("  ❌ {} Low liq (WS): ${:.0}", address, data.liquidity));
+                            return (None, None);
                         }
-                        return (None, None);
-                    }
-                };
 
-                // ─── MEME ALPHA ENRICHMENT (V3) ───
-                let mut meme_conviction = "N/A".to_string();
-                if let Ok(meme) = birdeye.get_meme_detail(&address).await {
-                    if meme.progress_percent > 80.0 && !meme.graduated {
-                        meme_conviction = format!("🔥 Bonding: {:.0}%", meme.progress_percent);
-                    } else if meme.graduated {
-                        meme_conviction = "🎓 Graduated".to_string();
-                    } else {
-                        meme_conviction = format!("Meme ({:.0}%)", meme.progress_percent);
+                        // Tier 3: Security Check (Required for both paths)
+                        let age_minutes = (chrono::Utc::now().timestamp() as u64 - data.meme_info.creation_time) as f64 / 60.0;
+                        
+                        match Scanner::check_safety_static(&birdeye, &tui_state, &address, age_minutes).await {
+                            Ok(true) => {},
+                            _ => return (None, Some(address.clone())),
+                        }
+
+                        let strategy = format!("🚀 WS-Fast (Bonding: {:.1}%)", data.meme_info.progress_percent);
+                        
+                        (Some(TokenCandidate {
+                            address: address.clone(),
+                            symbol: data.symbol,
+                            name: data.name,
+                            price: data.price,
+                            liquidity: data.liquidity,
+                            volume_5m: 0.0,
+                            price_change_m5: 0.0,
+                            strategy,
+                        }), None)
+                    }
+                    ScanJob::Address(address) => {
+                        // Add a longer delay for REST path to prevent CU exhaustion
+                        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+
+                        // Fetch detailed data from Birdeye
+                        let mut overview = match birdeye.get_token_overview(&address).await {
+                            Ok(o) => o,
+                            Err(e) => {
+                                debug_log(&format!("REJECT_API {} Overview Error: {}", address, e));
+                                tui_state.log_scanner(&format!("  ❌ {} skip: Overview Error: {}", address, e));
+                                return (None, None);
+                            }
+                        };
+                        
+                        // Heuristic Honeypot Check (since Free Tier might not have security API)
+                        if overview.sell_5m == 0 && overview.buy_5m > 0 {
+                            debug_log(&format!("REJECT_HONEYPOT {} Zero sells despite buys", address));
+                            tui_state.log_scanner(&format!("  ❌ {} suspected honeypot (0 sells)", address));
+                            return (None, Some(address.clone()));
+                        }
+
+                        let now_utc = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+                        let age_minutes = (now_utc - overview.created_at.unwrap_or(now_utc)) as f64 / 60.0;
+
+                        // Check static safety (Top 10 holders, Dev percentage, etc.)
+                        let is_safe = match Self::check_safety_static(&birdeye, &tui_state, &address, age_minutes).await {
+                            Ok(safe) => safe,
+                            Err(e) => {
+                                debug_log(&format!("SAFETY_ERROR {} - {}", address, e));
+                                return (None, Some(address.clone()));
+                            }
+                        };
+
+                        if !is_safe {
+                            return (None, Some(address.clone()));
+                        }
+
+                        // Enrich with Trending API data
+                        if let Some(t) = trending.iter().find(|t| &t.address == &address) {
+                            if overview.market_cap <= 0.0 {
+                                overview.market_cap = t.volume_24h.unwrap_or(0.0);
+                            }
+                            if overview.liquidity <= 0.0 {
+                                overview.liquidity = t.liquidity.unwrap_or(0.0);
+                            }
+                            if overview.volume_24h <= 0.0 {
+                                overview.volume_24h = t.volume_24h.unwrap_or(0.0);
+                            }
+                            if overview.price <= 0.0 {
+                                overview.price = t.price.unwrap_or(0.0);
+                            }
+                        }
+
+                        // ─── FILTERING LOGIC ───
+                        let age_minutes = overview.created_at
+                            .map(|ts| (chrono::Utc::now().timestamp() - ts) as f64 / 60.0)
+                            .unwrap_or(0.0);
+
+                        let m5_buys = overview.buy_5m;
+                        let m5_volume = overview.volume_5m;
+                        let liquidity = overview.liquidity;
+                        let price_change_m5 = overview.price_change_5m;
+
+                        // Anti-Wash Trade (relaxed: only flag if very few buys with huge avg size)
+                        let avg_buy_size = if m5_buys > 0 { m5_volume / m5_buys as f64 } else { 0.0 };
+                        if m5_buys < 10 && avg_buy_size > 2000.0 {
+                            debug_log(&format!("REJECT {} Wash trade (buys:{}, avg:${:.0})", address, m5_buys, avg_buy_size));
+                            tui_state.log_scanner(&format!("  ❌ {} Wash trade (buys:{}, avg:${:.0})", address, m5_buys, avg_buy_size));
+                            return (None, None);
+                        }
+
+                        // HARD FILTERS (relaxed for meme market reality)
+                        if liquidity < 2000.0 {
+                            debug_log(&format!("REJECT {} Low liq: ${:.0}", address, liquidity));
+                            tui_state.log_scanner(&format!("  ❌ {} Low liq: ${:.0}", address, liquidity));
+                            return (None, None);
+                        }
+                        if m5_buys < 2 {
+                            debug_log(&format!("REJECT {} Low buys: {} (sell:{}, vol5m:${:.0}, liq:${:.0})", address, m5_buys, overview.sell_5m, m5_volume, liquidity));
+                            tui_state.log_scanner(&format!("  ❌ {} Low buys: {}", address, m5_buys));
+                            return (None, None);
+                        }
+                        if overview.volume_24h < 500.0 && age_minutes > 60.0 {
+                            debug_log(&format!("REJECT {} Low vol24h: ${:.0} (age:{:.0}m)", address, overview.volume_24h, age_minutes));
+                            tui_state.log_scanner(&format!("  ❌ {} Low vol24h: ${:.0}", address, overview.volume_24h));
+                            return (None, None);
+                        }
+
+                        let is_healthy_momentum = m5_buys > (overview.sell_5m as f64 * 1.1) as u64 && m5_volume > 200.0;
+                        let strategy = Scanner::match_strategy_static(
+                            paper_trade, age_minutes, is_healthy_momentum, liquidity,
+                            price_change_m5, m5_volume, &overview
+                        );
+
+                        let strategy = match strategy {
+                            Some(s) => s,
+                            None => {
+                                debug_log(&format!("REJECT {} No strategy (age:{:.0}m, m5:{:.1}%, liq:${:.0}K, buys:{}, sells:{}, vol5m:${:.0}, healthy:{})", 
+                                    address, age_minutes, price_change_m5, liquidity/1000.0, m5_buys, overview.sell_5m, m5_volume, is_healthy_momentum));
+                                tui_state.log_scanner(&format!("  ❌ {} No strategy matched (m5:{:.1}%, liq:${:.0}K, buys:{})", address, price_change_m5, liquidity/1000.0, m5_buys));
+                                return (None, None);
+                            }
+                        };
+
+                        // Safety Check
+                        match Scanner::check_safety_static(&birdeye, &tui_state, &address, age_minutes).await {
+                            Ok(true) => {},
+                            Ok(false) => {
+                                debug_log(&format!("SAFETY_REJECT {} (age:{:.0}m) - see safety log above", address, age_minutes));
+                                return (None, Some(address.clone()));
+                            },
+                            Err(e) => {
+                                debug_log(&format!("SAFETY_ERROR {} - {}", address, e));
+                                return (None, Some(address.clone()));
+                            }
+                        }
+
+                        (Some(TokenCandidate {
+                            address: address.clone(),
+                            symbol: overview.symbol,
+                            name: overview.name,
+                            price: overview.price,
+                            liquidity,
+                            volume_5m: m5_volume,
+                            price_change_m5,
+                            strategy,
+                        }), None)
                     }
                 }
-
-                // ─── SAFETY CHECK (Birdeye Token Security) ───
-                // Always run safety check (even in paper trade for demo credibility)
-                match Scanner::check_safety_static(&birdeye, &tui_state, &address, age_minutes).await {
-                    Ok(true) => {
-                        tui_state.log_scanner(&format!("  ✅ ${} passed safety check", overview.symbol));
-                    },
-                    Ok(false) => {
-                        tui_state.log_scanner(&format!("  🛑 Safety Fail: ${} ({})", overview.symbol, meme_conviction));
-                        return (None, Some(address.clone()));
-                    }
-                    Err(_) => {
-                        // Security data unavailable = too risky, skip
-                        tui_state.log_scanner(&format!("  ❌ ${} Security check unavailable — skipping", overview.symbol));
-                        return (None, None);
-                    }
-                }
-
-                tui_state.log_scanner(&format!("🚀 [TARGET LOCKED!] {} | ${} | Price: ${:.8} | Stats: {}",
-                    strategy, overview.symbol, overview.price, meme_conviction));
-
-                let candidate = TokenCandidate {
-                    address: address.clone(),
-                    symbol: overview.symbol,
-                    name: overview.name,
-                    price: overview.price,
-                    liquidity,
-                    volume_5m: m5_volume,
-                    price_change_m5,
-                    strategy,
-                };
-                
-                (Some(candidate), None)
             }
-        }).buffer_unordered(1); // SEQUENTIAL ONLY to prevent Compute Unit limit explosion
+        // Process sequentially (1) or at most 2 to avoid Birdeye CU limits
+        }).buffer_unordered(1);
 
         let mut candidates = Vec::new();
-        while let Some((candidate_opt, blacklist_opt)) = stream.next().await {
+        while let Some((candidate_opt, blacklist_opt)) = combined_stream.next().await {
             if let Some(blacklist_addr) = blacklist_opt {
                 self.safety_blacklist.insert(blacklist_addr, Instant::now());
             }
@@ -326,61 +391,84 @@ impl Scanner {
         let h1_volume = overview.volume_1h;
         let avg_m5_from_h1 = if h1_volume > 0.0 { h1_volume / 12.0 } else { 0.0 };
         let is_volume_spiking = avg_m5_from_h1 > 0.0 && m5_volume > (avg_m5_from_h1 * 1.5);
-
-        // Thresholds (unified — Paper = Live)
+        // Thresholds (Strict Meme Sniper requirements)
         let min_liq_new = 4000.0;
         let min_liq_old = 10000.0;
-        let min_m5_pct = 1.5;
-        let min_h1_pct = 2.0;
+        let min_m5_pct = 3.0; // Must pump at least 3% in 5m
+        let min_h1_pct = 10.0; // Must be up at least 10% in 1h
 
-        // ═══ STRATEGY 1: Early Momentum (New Token < 1h) ═══
-        if age_minutes >= 5.0 && age_minutes <= 60.0 {
+        // ═══ STRATEGY 1: Early Momentum (New Token < 2h) ═══
+        if age_minutes >= 2.0 && age_minutes <= 120.0 {
             if is_healthy_momentum && liquidity > min_liq_new && price_change_m5 > min_m5_pct {
                 return Some(format!("⚡ Early Momentum (5m: +{:.1}%, Liq: ${:.0}K)", price_change_m5, liquidity / 1000.0));
             }
         }
 
         // ═══ STRATEGY 2: Whale Accumulation (1h pumping + volume spike) ═══
-        if age_minutes > 60.0 && h1_change > min_h1_pct && is_volume_spiking 
+        if age_minutes > 30.0 && h1_change > min_h1_pct && is_volume_spiking 
             && liquidity > min_liq_old && is_healthy_momentum {
             return Some(format!("🐋 Whale Accumulation (1h: +{:.1}%, Vol Spike: {:.0}x)", h1_change, 
                 if avg_m5_from_h1 > 0.0 { m5_volume / avg_m5_from_h1 } else { 0.0 }));
         }
 
         // ═══ STRATEGY 3: Dip Sniper (24h/1h ลบ แต่ 5m กลับตัวแรง) ═══
-        if age_minutes > 60.0 && (h1_change < 0.0 || h24_change < -5.0) 
-            && price_change_m5 > 3.0 && is_volume_spiking 
+        if age_minutes > 30.0 && (h1_change < 0.0 || h24_change < -5.0) 
+            && price_change_m5 > 1.5 && is_volume_spiking 
             && liquidity > min_liq_old && is_healthy_momentum {
             return Some(format!("🎯 Dip Sniper (24h: {:.1}%, 1h: {:.1}%, 5m reversal: +{:.1}%)", h24_change, h1_change, price_change_m5));
         }
 
         // ═══ STRATEGY 4: Volume Breakout (5m volume spike ผิดปกติ) ═══
-        if age_minutes > 30.0 && avg_m5_from_h1 > 0.0 && m5_volume > (avg_m5_from_h1 * 3.0)
-            && liquidity > min_liq_old && price_change_m5 > 0.5 {
+        if age_minutes > 15.0 && avg_m5_from_h1 > 0.0 && m5_volume > (avg_m5_from_h1 * 3.0)
+            && liquidity > min_liq_new && price_change_m5 > 2.0 {
             return Some(format!("📊 Volume Breakout (Vol: {:.0}x avg, 5m: +{:.1}%)", m5_volume / avg_m5_from_h1, price_change_m5));
+        }
+
+        // ═══ STRATEGY 5: Fresh Pump (Brand new token with aggressive positive momentum) ═══
+        if age_minutes < 30.0 && liquidity > min_liq_new && price_change_m5 > 3.0 && m5_volume > 500.0 {
+            return Some(format!("🔥 Fresh Pump (Age: {:.0}m, 5m: +{:.1}%)", age_minutes, price_change_m5));
         }
 
         None
     }
 
     async fn check_safety_static(birdeye: &BirdeyeClient, tui_state: &crate::tui::TuiState, address: &str, age_minutes: f64) -> Result<bool, String> {
-        let security = birdeye.get_token_security(address).await?;
+        let security = match birdeye.get_token_security(address).await {
+            Ok(s) => s,
+            Err(e) => {
+                if e.contains("401") || e.contains("403") || e.contains("Compute units") {
+                    debug_log(&format!("SAFETY_WARNING {} - API Limit ({}). Bypassing security.", address, e));
+                    return Ok(true);
+                } else {
+                    return Err(e);
+                }
+            }
+        };
+
+        debug_log(&format!("SECURITY_DATA {} top10:{:?} creator:{:?} mintable:{:?} freezable:{:?}", 
+            address, security.top10_holder_percent, security.creator_percentage, security.is_mintable, security.is_freezable));
 
         // Top 10 Holders check (relaxed based on age and Pump.fun curve)
         if let Some(top10) = security.top10_holder_percent {
+            // Normalize: if value > 1.0, Birdeye sent it as percentage (85.0 = 85%)
+            let top10_normalized = if top10 > 1.0 { top10 / 100.0 } else { top10 };
             // Note: Pump.fun bonding curves hold 80% of the supply initially.
-            // If the token is very new (< 60 mins), the top 10 holders will almost always be > 80% due to the curve.
-            let max_top10 = if age_minutes < 60.0 { 0.95 } else if age_minutes > 1440.0 { 0.40 } else { 0.30 };
-            if top10 > max_top10 {
-                tui_state.log_scanner(&format!("  ❌ ${} Top 10 Holders > {:.0}% ({:.1}%)", address, max_top10 * 100.0, top10 * 100.0));
+            // Meme tokens almost always have high top10 concentration, even after hours.
+            let max_top10 = if age_minutes < 60.0 { 0.98 } else if age_minutes < 360.0 { 0.90 } else if age_minutes > 1440.0 { 0.50 } else { 0.80 };
+            if top10_normalized > max_top10 {
+                debug_log(&format!("REJECT_TOP10 {} raw:{} norm:{:.3} max:{:.2} age:{:.0}m", address, top10, top10_normalized, max_top10, age_minutes));
+                tui_state.log_scanner(&format!("  ❌ {} Top10: {:.1}% > {:.0}%", address, top10_normalized * 100.0, max_top10 * 100.0));
                 return Ok(false);
             }
         }
 
         // Creator percentage check
         if let Some(creator_pct) = security.creator_percentage {
-            if creator_pct > 0.15 {
-                tui_state.log_scanner(&format!("  ❌ ${} Dev holds {:.1}%", address, creator_pct));
+            // Normalize: if value > 1.0, it's a percentage
+            let creator_normalized = if creator_pct > 1.0 { creator_pct / 100.0 } else { creator_pct };
+            if creator_normalized > 0.15 {
+                debug_log(&format!("REJECT_CREATOR {} raw:{} norm:{:.3}", address, creator_pct, creator_normalized));
+                tui_state.log_scanner(&format!("  ❌ {} Dev holds {:.1}%", address, creator_normalized * 100.0));
                 return Ok(false);
             }
         }

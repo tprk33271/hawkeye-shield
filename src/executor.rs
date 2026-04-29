@@ -43,10 +43,7 @@ pub struct TradeExecutor {
     pub tui_state: std::sync::Arc<crate::tui::TuiState>,
 }
 
-pub enum NewPairType {
-    Raydium,
-    PumpFun,
-}
+
 
 impl TradeExecutor {
     pub fn new(config: Config, birdeye: BirdeyeClient, active_trades: Arc<Mutex<HashMap<String, ActiveTrade>>>, tui_state: std::sync::Arc<crate::tui::TuiState>) -> Self {
@@ -87,64 +84,7 @@ impl TradeExecutor {
         }
     }
 
-    /// Fetch Mint address from a transaction signature (Real-time Sniper logic)
-    pub async fn fetch_mint_from_sig(&self, signature: &str, pair_type: NewPairType) -> Option<String> {
-        use solana_client::rpc_config::RpcTransactionConfig;
-        use solana_transaction_status::UiTransactionEncoding;
-        use solana_sdk::signature::Signature;
 
-        let sig = match Signature::from_str(signature) {
-            Ok(s) => s,
-            Err(_) => return None,
-        };
-
-        let config = RpcTransactionConfig {
-            encoding: Some(UiTransactionEncoding::JsonParsed),
-            commitment: Some(CommitmentConfig::confirmed()),
-            max_supported_transaction_version: Some(0),
-        };
-
-        match self.read_rpc.get_transaction_with_config(&sig, config) {
-            Ok(tx) => {
-                let meta = tx.transaction.meta?;
-                
-                // Better approach: Look at postTokenBalances to find the new token
-                if let solana_transaction_status::option_serializer::OptionSerializer::Some(balances) = meta.post_token_balances {
-                    for balance in balances {
-                        let mint = balance.mint;
-                        // Skip WSOL
-                        if mint != SOL_MINT {
-                            return Some(mint);
-                        }
-                    }
-                }
-
-                // Fallback to account indices if balances are empty (unlikely for successful pool creation)
-                let msg = tx.transaction.transaction.decode()?.message;
-                let accounts = msg.static_account_keys();
-                
-                match pair_type {
-                    NewPairType::PumpFun => {
-                        if accounts.len() > 1 {
-                            return Some(accounts[1].to_string());
-                        }
-                    }
-                    NewPairType::Raydium => {
-                        // Raydium Initialize2: accounts 8 and 9 are the mints
-                        if accounts.len() > 9 {
-                            let m1 = accounts[8].to_string();
-                            let m2 = accounts[9].to_string();
-                            return if m1 == SOL_MINT { Some(m2) } else { Some(m1) };
-                        }
-                    }
-                }
-                None
-            }
-            Err(_e) => {
-                None
-            }
-        }
-    }
 
     /// Get token balance for wallet (amount + decimals)
     fn get_token_balance(&self, mint: &str) -> (u64, u8) {
