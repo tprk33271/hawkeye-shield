@@ -265,6 +265,8 @@ impl Scanner {
                     price_change_m5,
                     strategy,
                 };
+                
+                (Some(candidate), None)
             }
         }).buffer_unordered(1); // SEQUENTIAL ONLY to prevent Compute Unit limit explosion
 
