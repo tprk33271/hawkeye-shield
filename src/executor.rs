@@ -105,15 +105,18 @@ impl TradeExecutor {
             solana_client::rpc_request::TokenAccountsFilter::Mint(mint_pk),
         ) {
             Ok(accounts) if !accounts.is_empty() => {
-                if let Some(data) = accounts[0].account.data.decode() {
-                    // SPL Token account: amount at offset 64, 8 bytes LE
-                    if data.len() >= 72 {
-                        let amount = u64::from_le_bytes(data[64..72].try_into().unwrap_or([0u8; 8]));
-                        // decimals need mint info, default 6 for most meme tokens
-                        return (amount, 6);
+                let token_account_pubkey = match solana_sdk::pubkey::Pubkey::from_str(&accounts[0].pubkey) {
+                    Ok(pk) => pk,
+                    Err(_) => return (0, 6),
+                };
+                match self.read_rpc.get_token_account_balance(&token_account_pubkey) {
+                    Ok(balance) => {
+                        let amount = balance.amount.parse::<u64>().unwrap_or(0);
+                        let decimals = balance.decimals;
+                        (amount, decimals)
                     }
+                    Err(_) => (0, 6),
                 }
-                (0, 6)
             }
             _ => (0, 6),
         }
@@ -596,8 +599,13 @@ impl TradeExecutor {
         // Get token balance
         let (amount, _decimals) = self.get_token_balance(&token.address);
         if amount == 0 {
-            self.tui_state.log_trade(&format!("❌ [SELL FAILED] ${} balance is 0", token.symbol));
-            return;
+            // [SAFETY] Retry check to avoid RPC glitch removing position
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+            let (retry_amount, _) = self.get_token_balance(&token.address);
+            if retry_amount == 0 {
+                self.tui_state.log_trade(&format!("❌ [SELL FAILED] ${} balance is 0", token.symbol));
+                return;
+            }
         }
 
         let sell_amount = (amount as f64 * (pct as f64 / 100.0)) as u64;
