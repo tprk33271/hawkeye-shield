@@ -392,10 +392,16 @@ impl Scanner {
         let avg_m5_from_h1 = if h1_volume > 0.0 { h1_volume / 12.0 } else { 0.0 };
         let is_volume_spiking = avg_m5_from_h1 > 0.0 && m5_volume > (avg_m5_from_h1 * 1.5);
         // Thresholds (Balanced: catch opportunities while filtering junk)
+        // ┌─────────────────────────────────────────────────────────────┐
+        // │ PRODUCTION VALUES (for live trading with real capital):    │
+        // │   min_liq_new = 4000, min_liq_old = 10000                 │
+        // │   min_m5_pct = 3.0,   min_h1_pct = 10.0                  │
+        // │ CURRENT VALUES (tuned for demo & paper trade):            │
+        // └─────────────────────────────────────────────────────────────┘
         let min_liq_new = 2000.0;
         let min_liq_old = 5000.0;
-        let min_m5_pct = 1.0; // Must pump at least 1% in 5m
-        let min_h1_pct = 5.0; // Must be up at least 5% in 1h
+        let min_m5_pct = 1.0;
+        let min_h1_pct = 5.0;
 
         // ═══ STRATEGY 1: Early Momentum (New Token < 2h) ═══
         if age_minutes >= 2.0 && age_minutes <= 120.0 {
