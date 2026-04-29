@@ -1,5 +1,5 @@
+#![allow(dead_code)]
 use reqwest::header::{HeaderMap, HeaderValue};
-use serde::Deserialize;
 
 // ============================================================
 // Birdeye API Client — Core Data Source for HawkEye Shield
@@ -31,11 +31,36 @@ impl BirdeyeClient {
         }
     }
 
+    async fn get_with_retry(&self, url: &str) -> Result<serde_json::Value, String> {
+        let mut attempts = 0;
+        let max_attempts = 3;
+        let mut delay = std::time::Duration::from_millis(500);
+
+        loop {
+            let resp = self.client.get(url).send().await.map_err(|e| e.to_string())?;
+            let status = resp.status();
+            
+            if status.is_success() {
+                let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+                return Ok(body);
+            }
+
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS && attempts < max_attempts {
+                attempts += 1;
+                tokio::time::sleep(delay).await;
+                delay *= 2; // Exponential backoff
+                continue;
+            }
+
+            let body_text = resp.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(format!("API Error {}: {}", status, body_text));
+        }
+    }
+
     // ─── Trending Tokens (replaces DexScreener trending) ───
     pub async fn get_trending(&self) -> Result<Vec<TrendingToken>, String> {
-        let url = format!("{}/defi/token_trending?sort_by=rank&sort_type=asc&offset=0&limit=20", self.base_url);
-        let resp = self.client.get(&url).send().await.map_err(|e| e.to_string())?;
-        let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        let url = format!("{}/defi/token_trending?sort_by=rank&sort_type=asc&offset=0&limit=10", self.base_url);
+        let body = self.get_with_retry(&url).await?;
 
         let tokens = body["data"]["tokens"].as_array()
             .unwrap_or(&vec![])
@@ -59,9 +84,9 @@ impl BirdeyeClient {
 
     // ─── New Listings (replaces DexScreener profiles) ───
     pub async fn get_new_listings(&self) -> Result<Vec<NewListing>, String> {
-        let url = format!("{}/defi/v3/token/new_listing?limit=20", self.base_url);
-        let resp = self.client.get(&url).send().await.map_err(|e| e.to_string())?;
-        let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        // Added meme_platform_enabled=true for better Pump.fun coverage
+        let url = format!("{}/defi/v2/tokens/new_listing?limit=15&meme_platform_enabled=true", self.base_url);
+        let body = self.get_with_retry(&url).await?;
 
         let items = body["data"]["items"].as_array()
             .unwrap_or(&vec![])
@@ -71,9 +96,9 @@ impl BirdeyeClient {
                     address: t["address"].as_str()?.to_string(),
                     symbol: t["symbol"].as_str().unwrap_or("???").to_string(),
                     name: t["name"].as_str().unwrap_or("Unknown").to_string(),
-                    price: t["price"].as_f64(),
+                    price: None, 
                     liquidity: t["liquidity"].as_f64(),
-                    listing_time: t["openTimestamp"].as_i64(),
+                    listing_time: None,
                 })
             })
             .collect();
@@ -84,8 +109,7 @@ impl BirdeyeClient {
     // ─── Token Price (replaces Jupiter Price API fallback) ───
     pub async fn get_price(&self, address: &str) -> Result<f64, String> {
         let url = format!("{}/defi/price?address={}", self.base_url, address);
-        let resp = self.client.get(&url).send().await.map_err(|e| e.to_string())?;
-        let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        let body = self.get_with_retry(&url).await?;
 
         body["data"]["value"].as_f64()
             .ok_or_else(|| "Price not found".to_string())
@@ -94,8 +118,12 @@ impl BirdeyeClient {
     // ─── Token Overview (replaces DexScreener token data) ───
     pub async fn get_token_overview(&self, address: &str) -> Result<TokenOverview, String> {
         let url = format!("{}/defi/token_overview?address={}", self.base_url, address);
-        let resp = self.client.get(&url).send().await.map_err(|e| e.to_string())?;
-        let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        let body = self.get_with_retry(&url).await?;
+
+        if body["success"].as_bool() == Some(false) {
+            return Err(format!("API Success=false: {}", body["message"].as_str().unwrap_or("Unknown")));
+        }
+
         let d = &body["data"];
 
         Ok(TokenOverview {
@@ -120,8 +148,7 @@ impl BirdeyeClient {
     // ─── Token Security (replaces GMGN safety check) ───
     pub async fn get_token_security(&self, address: &str) -> Result<TokenSecurity, String> {
         let url = format!("{}/defi/token_security?address={}", self.base_url, address);
-        let resp = self.client.get(&url).send().await.map_err(|e| e.to_string())?;
-        let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        let body = self.get_with_retry(&url).await?;
         let d = &body["data"];
 
         Ok(TokenSecurity {
@@ -134,26 +161,62 @@ impl BirdeyeClient {
         })
     }
 
-    // ─── Trade Data (replaces DexScreener txns m5/h1) ───
-    pub async fn get_trade_data(&self, address: &str) -> Result<TradeData, String> {
-        let url = format!("{}/defi/v3/token/trade-data/single?address={}", self.base_url, address);
-        let resp = self.client.get(&url).send().await.map_err(|e| e.to_string())?;
-        let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    pub async fn get_meme_detail(&self, address: &str) -> Result<MemeDetail, String> {
+        let url = format!("{}/defi/v3/token/meme-detail/single?address={}", self.base_url, address);
+        let body = self.get_with_retry(&url).await?;
         let d = &body["data"];
 
-        Ok(TradeData {
-            buy_5m: d["buy5m"].as_u64().unwrap_or(0),
-            sell_5m: d["sell5m"].as_u64().unwrap_or(0),
-            buy_1h: d["buy1h"].as_u64().unwrap_or(0),
-            sell_1h: d["sell1h"].as_u64().unwrap_or(0),
-            volume_5m_usd: d["v5mUSD"].as_f64().unwrap_or(0.0),
-            volume_1h_usd: d["v1hUSD"].as_f64().unwrap_or(0.0),
-            volume_24h_usd: d["v24hUSD"].as_f64().unwrap_or(0.0),
+        Ok(MemeDetail {
+            address: d["address"].as_str().unwrap_or(address).to_string(),
+            graduated: d["meme_info"]["graduated"].as_bool().unwrap_or(false),
+            progress_percent: d["meme_info"]["progress_percent"].as_f64().unwrap_or(0.0),
+            real_sol_reserves: d["meme_info"]["pool"]["real_sol_reserves"].as_f64().unwrap_or(0.0),
+            creator: d["meme_info"]["creator"].as_str().unwrap_or("").to_string(),
         })
+    }
+
+    pub async fn get_meme_list(&self, min_liquidity: f64) -> Result<Vec<NewListing>, String> {
+        // Using explicit sorting and source to ensure results (Birdeye V3)
+        let url = format!("{}/defi/v3/token/meme/list?sort_by=creation_time&sort_type=desc&min_liquidity={}&limit=10&source=all", self.base_url, min_liquidity);
+        let body = self.get_with_retry(&url).await?;
+        
+        let mut tokens = Vec::new();
+        let data = &body["data"];
+        if let Some(items) = data["items"].as_array() {
+            for item in items {
+                tokens.push(NewListing {
+                    address: item["address"].as_str().unwrap_or("").to_string(),
+                    symbol: item["symbol"].as_str().unwrap_or("").to_string(),
+                    name: item["name"].as_str().unwrap_or("").to_string(),
+                    price: item["price"].as_f64(),
+                    liquidity: item["liquidity"].as_f64(),
+                    listing_time: item["creation_time"].as_i64(),
+                });
+            }
+        }
+        Ok(tokens)
     }
 }
 
-// ─── Data Structures ───
+#[derive(Debug, Clone)]
+pub struct MemeTokenInfo {
+    pub address: String,
+    pub symbol: String,
+    pub name: String,
+    pub price: f64,
+    pub liquidity: f64,
+    pub mc: f64,
+    pub last_trade_unix_time: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemeDetail {
+    pub address: String,
+    pub graduated: bool,
+    pub progress_percent: f64,
+    pub real_sol_reserves: f64,
+    pub creator: String,
+}
 
 #[derive(Debug, Clone)]
 pub struct TrendingToken {
@@ -204,15 +267,4 @@ pub struct TokenSecurity {
     pub creator_percentage: Option<f64>,
     pub owner_percentage: Option<f64>,
     pub is_true_token: Option<bool>,
-}
-
-#[derive(Debug, Clone)]
-pub struct TradeData {
-    pub buy_5m: u64,
-    pub sell_5m: u64,
-    pub buy_1h: u64,
-    pub sell_1h: u64,
-    pub volume_5m_usd: f64,
-    pub volume_1h_usd: f64,
-    pub volume_24h_usd: f64,
 }

@@ -4,13 +4,17 @@ mod executor;
 mod logger;
 mod scanner;
 mod websocket;
+mod tui;
 
 use crate::birdeye::BirdeyeClient;
 use crate::config::Config;
 use crate::executor::TradeExecutor;
 use crate::scanner::Scanner;
+use crate::tui::{run_tui, TuiState};
 use crate::websocket::{start_websocket, WsEvent};
 use tokio::sync::mpsc;
+use std::sync::Arc;
+use std::collections::HashMap;
 
 // ============================================================
 // HawkEye Shield — Autonomous Solana Trading Agent
@@ -19,41 +23,38 @@ use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("hawkeye_shield=info".parse().unwrap())
-                .add_directive("reqwest=warn".parse().unwrap())
-        )
-        .with_target(false)
-        .init();
-
+    // We don't initialize tracing_subscriber to stdout because TUI will take over the screen.
+    // Optionally, we could write tracing logs to a file. For now, we rely on TuiState.
+    
     let config = Config::from_env();
 
     if config.birdeye_api_key.is_empty() || config.birdeye_api_key == "your_birdeye_api_key_here" {
-        tracing::error!("❌ BIRDEYE_API_KEY ไม่ได้ตั้งค่า — กรุณาใส่ใน .env");
+        eprintln!("❌ BIRDEYE_API_KEY not set — Please add to .env");
         std::process::exit(1);
     }
 
-    let mode = if config.paper_trade { "📝 PAPER TRADE" } else { "💰 LIVE TRADE" };
-    let wallet_str = config.wallet_pubkey_str();
-    let wallet_short = if wallet_str.len() > 8 { &wallet_str[..8] } else { &wallet_str };
-
-    println!();
-    println!("  ╔══════════════════════════════════════════════════╗");
-    println!("  ║      🦅 HawkEye Shield — Solana Sniper Agent    ║");
-    println!("  ║      Powered by Birdeye Data API                 ║");
-    println!("  ╠══════════════════════════════════════════════════╣");
-    println!("  ║  Mode:    {:<40}║", mode);
-    println!("  ║  Wallet:  {}...{:<31}║", wallet_short, "");
-    println!("  ║  Size:    {} SOL per trade{:<24}║", config.trade_size_sol, "");
-    println!("  ║  TP/SL:   +{}% / -{}%{:<28}║", config.take_profit_pct, config.stop_loss_pct, "");
-    println!("  ╚══════════════════════════════════════════════════╝");
-    println!();
-
     let birdeye = BirdeyeClient::new(&config.birdeye_api_key);
-    let executor = TradeExecutor::new(config.clone(), birdeye.clone());
-    let mut scanner = Scanner::new(birdeye.clone(), config.clone());
+    
+    // Shared state for all executors to see the same active trades
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex as TokioMutex;
+    let shared_trades = Arc::new(TokioMutex::new(HashMap::new()));
+    
+    // Initialize TUI State
+    let tui_state = Arc::new(TuiState::new(shared_trades.clone(), config.clone()));
+    
+    // Spawn TUI rendering loop in background
+    let tui_state_clone = tui_state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = run_tui(tui_state_clone).await {
+            eprintln!("TUI Error: {}", e);
+            std::process::exit(1);
+        }
+    });
+
+    let executor = TradeExecutor::new(config.clone(), birdeye.clone(), shared_trades.clone(), tui_state.clone());
+    let mut scanner = Scanner::new(birdeye.clone(), config.clone(), tui_state.clone());
 
     let (ws_tx, mut ws_rx) = mpsc::channel::<WsEvent>(100);
 
@@ -64,10 +65,9 @@ async fn main() {
     });
 
     let max_trades = config.max_active_trades;
-    let trade_size = config.trade_size_sol;
-    let mut scan_interval = tokio::time::interval(std::time::Duration::from_secs(8));
+    let mut scan_interval = tokio::time::interval(std::time::Duration::from_secs(30));
 
-    tracing::info!("🚀 HawkEye Shield เริ่มทำงาน! (WebSocket + Polling ทุก 8 วินาที)");
+    tui_state.log_scanner("🚀 HawkEye Shield Started! (WebSocket + Polling every 15s)");
 
     loop {
         tokio::select! {
@@ -77,18 +77,37 @@ async fn main() {
 
                 match event {
                     WsEvent::NewPairRaydium(sig) => {
-                        tracing::info!("⚡ [WS-Raydium] Processing new pair: {}...", &sig[..sig.len().min(8)]);
+                        if let Some(mint) = executor.fetch_mint_from_sig(&sig, crate::executor::NewPairType::Raydium).await {
+                            tui_state.log_scanner(&format!("🔔 [WS] New Raydium Pool: {}", mint));
+                            if let Some(token) = scanner.scan_single(&mint).await {
+                                handle_buy(token, &executor, &config, &birdeye, &shared_trades, &tui_state).await;
+                            }
+                        }
                     }
                     WsEvent::NewPairPumpFun(sig) => {
-                        tracing::info!("💊 [WS-PumpFun] Processing new token: {}...", &sig[..sig.len().min(8)]);
+                        if let Some(mint) = executor.fetch_mint_from_sig(&sig, crate::executor::NewPairType::PumpFun).await {
+                            tui_state.log_scanner(&format!("💊 [WS] New Pump.fun: {}", mint));
+                            if let Some(token) = scanner.scan_single(&mint).await {
+                                handle_buy(token, &executor, &config, &birdeye, &shared_trades, &tui_state).await;
+                            }
+                        }
                     }
                 }
             }
 
             _ = scan_interval.tick() => {
                 let active_count = executor.active_trades.lock().await.len();
+                
+                // Update balance in TUI state
+                if !config.paper_trade {
+                    let current_balance = executor.get_sol_balance();
+                    if let Ok(mut bal) = tui_state.balance.lock() {
+                        *bal = current_balance;
+                    }
+                }
+                // For paper trade, balance is managed by paper_buy/paper_sell
+
                 if active_count >= max_trades {
-                    tracing::debug!("⏸️ Max trades ({}/{}), skip scan", active_count, max_trades);
                     continue;
                 }
 
@@ -96,33 +115,54 @@ async fn main() {
                     .keys().cloned().collect();
 
                 if let Some(token) = scanner.scan_for_opportunities(&active_addresses).await {
-                    tracing::info!("💰 [Execution] ซื้อ: ${} จำนวน {} SOL", token.symbol, trade_size);
-
-                    match executor.execute_buy(&token, trade_size).await {
-                        Ok(result) if result.success => {
-                            tracing::info!("✅ [BUY SUCCESS] ${} @ ${:.8}", token.symbol, result.buy_price);
-
-                            let token_clone = token.clone();
-                            let buy_price = result.buy_price;
-                            let spent = result.trade_size_sol;
-                            let birdeye_clone = birdeye.clone();
-                            let config_clone = config.clone();
-
-                            tokio::spawn(async move {
-                                let monitor_executor = TradeExecutor::new(config_clone, birdeye_clone);
-                                let pnl = monitor_executor.monitor_and_sell(token_clone, buy_price, spent).await;
-                                tracing::info!("📊 [Trade Complete] PNL: {:.2}%", pnl);
-                            });
-                        }
-                        Ok(_) => {
-                            tracing::error!("❌ [BUY FAILED] ${}", token.symbol);
-                        }
-                        Err(e) => {
-                            tracing::error!("❌ [BUY ERROR] ${}: {}", token.symbol, e);
-                        }
-                    }
+                    handle_buy(token, &executor, &config, &birdeye, &shared_trades, &tui_state).await;
                 }
             }
         }
     }
 }
+
+async fn handle_buy(
+    token: crate::scanner::TokenCandidate,
+    executor: &TradeExecutor,
+    config: &Config,
+    birdeye: &BirdeyeClient,
+    shared_trades: &Arc<tokio::sync::Mutex<HashMap<String, crate::executor::ActiveTrade>>>,
+    tui_state: &Arc<TuiState>
+) {
+    let balance = tui_state.balance.lock().unwrap().clone();
+    let trade_size = if config.use_dynamic_sizing && balance > 0.0 {
+        (balance * config.kelly_fraction).max(0.01) // Ensure a minimum size
+    } else {
+        config.trade_size_sol
+    };
+
+    tui_state.log_trade(&format!("💰 [Execution] Buying ${} for {:.3} SOL", token.symbol, trade_size));
+
+    match executor.execute_buy(&token, trade_size).await {
+        Ok(result) if result.success => {
+            tui_state.log_trade(&format!("✅ [BUY SUCCESS] ${} @ ${:.8}", token.symbol, result.buy_price));
+
+            let token_clone = token.clone();
+            let buy_price = result.buy_price;
+            let spent = result.trade_size_sol;
+            let birdeye_clone = birdeye.clone();
+            let config_clone = config.clone();
+            let shared_trades_clone = shared_trades.clone();
+            let tui_state_monitor = tui_state.clone();
+
+            tokio::spawn(async move {
+                let monitor_executor = TradeExecutor::new(config_clone, birdeye_clone, shared_trades_clone, tui_state_monitor.clone());
+                let pnl = monitor_executor.monitor_and_sell(token_clone, buy_price, spent).await;
+                tui_state_monitor.log_trade(&format!("📊 [Trade Complete] PNL: {:.2}%", pnl));
+            });
+        }
+        Ok(_) => {
+            tui_state.log_trade(&format!("❌ [BUY FAILED] ${}", token.symbol));
+        }
+        Err(e) => {
+            tui_state.log_trade(&format!("❌ [BUY ERROR] ${}: {}", token.symbol, e));
+        }
+    }
+}
+
