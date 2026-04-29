@@ -86,9 +86,11 @@ Unlike simple search tools, HawkEye Shield is an **active participant** in the m
 | Endpoint | Logic | Why Birdeye? |
 |---|---|---|
 | `/defi/token_trending` | Used for momentum-based sniping. | Superior sorting/ranking compared to standard DEX feeds. |
-| `/defi/v3/token/new_listing` | Triggers immediate analysis for new market opportunities. | Instant indexing of new SPL tokens. |
+| `/defi/v2/tokens/new_listing` | Triggers immediate analysis for new market opportunities. | Instant indexing of new SPL tokens. |
+| `/defi/v3/token/meme/list` | Discovers newly minted meme tokens matching specific liquidity criteria. | High conviction alpha specifically for meme narrative. |
 | `/defi/token_overview` | Extracts `liquidity`, `v5mUSD`, and `priceChange5mPercent`. | High-fidelity data for micro-cap volatility. |
 | `/defi/token_security` | Evaluates `top10HolderPercent`, `isMintable`, and `isFreezable`. | Crucial for automated risk mitigation (anti-rug). |
+| `/defi/v3/token/meme-detail/single` | Extracts developer details, website, and socials. | Provides fundamental social conviction for a token. |
 | `/defi/price` | Real-time monitoring and exact entry price calculation. | Eliminates "price lag" found in aggregate price APIs. |
 
 ---
