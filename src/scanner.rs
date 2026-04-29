@@ -349,9 +349,11 @@ impl Scanner {
     async fn check_safety_static(birdeye: &BirdeyeClient, tui_state: &crate::tui::TuiState, address: &str, age_minutes: f64) -> Result<bool, String> {
         let security = birdeye.get_token_security(address).await?;
 
-        // Top 10 Holders check (relaxed based on age)
+        // Top 10 Holders check (relaxed based on age and Pump.fun curve)
         if let Some(top10) = security.top10_holder_percent {
-            let max_top10 = if age_minutes > 1440.0 { 0.40 } else { 0.30 };
+            // Note: Pump.fun bonding curves hold 80% of the supply initially.
+            // If the token is very new (< 60 mins), the top 10 holders will almost always be > 80% due to the curve.
+            let max_top10 = if age_minutes < 60.0 { 0.95 } else if age_minutes > 1440.0 { 0.40 } else { 0.30 };
             if top10 > max_top10 {
                 tui_state.log_scanner(&format!("  ❌ ${} Top 10 Holders > {:.0}% ({:.1}%)", address, max_top10 * 100.0, top10 * 100.0));
                 return Ok(false);
