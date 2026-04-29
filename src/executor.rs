@@ -228,6 +228,7 @@ impl TradeExecutor {
         }
 
         let quote_resp = client.get(&quote_url)
+            .header("Accept", "application/json")
             .headers(headers.clone())
             .send().await.map_err(|e| format!("Quote request failed: {}", e))?;
 
@@ -251,10 +252,11 @@ impl TradeExecutor {
                 "quoteResponse": quote,
                 "userPublicKey": wallet.pubkey().to_string(),
                 "wrapAndUnwrapSol": true,
-                "prioritizationFeeLamports": (self.config.priority_fee_micro_lamports / 1000)
+                "prioritizationFeeLamports": self.config.priority_fee_micro_lamports
             });
             let swap_url = format!("{}/swap", self.jup_base);
             let swap_resp_raw = client.post(&swap_url)
+                .header("Content-Type", "application/json")
                 .headers(headers.clone())
                 .json(&swap_body)
                 .send().await.map_err(|e| format!("Swap request failed: {}", e))?;
