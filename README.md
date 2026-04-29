@@ -132,8 +132,10 @@ SOLANA_PRIVATE_KEY=your_base58_key
 SOLANA_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxx
 SOLANA_WRITE_RPC_URL=https://mainnet.helius-rpc.com/?api-key=xxx
 
-# Trading
-TRADE_SIZE_SOL=0.05
+# Trading & Position Sizing
+USE_DYNAMIC_SIZING=true    # If true, uses Kelly Fraction. If false, uses fixed TRADE_SIZE_SOL.
+KELLY_FRACTION=0.15        # Buy using 15% of current wallet balance
+TRADE_SIZE_SOL=0.05        # Fixed buy amount (only used if dynamic sizing is false)
 TAKE_PROFIT_PERCENT=40
 STOP_LOSS_PERCENT=12
 SLIPPAGE_BPS=250
