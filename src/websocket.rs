@@ -2,9 +2,11 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 // ============================================================
 // WebSocket — Birdeye Native Real-time Meme Data & Prices
+// Supports BDS (Business+) with graceful fallback for Free tier
 // ============================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +43,8 @@ pub enum BirdeyeEvent {
     MemeData { data: MemeData },
     #[serde(rename = "PRICE_DATA")]
     PriceData { data: PriceData },
+    #[serde(rename = "WELCOME")]
+    Welcome,
     #[serde(other)]
     Unknown,
 }
@@ -54,27 +58,59 @@ pub enum WsCommand {
     SubscribePrice(String),
 }
 
-pub async fn start_websocket(api_key: &str, tx: mpsc::Sender<WsEvent>, mut cmd_rx: mpsc::Receiver<WsCommand>) {
-    let ws_url = format!("wss://public-api.birdeye.so/socket/solana?x-api-key={}", api_key);
+/// Track whether WS is active for the rest of the system
+#[allow(dead_code)]
+pub struct WsStatus {
+    pub connected: bool,
+    pub received_data: bool,
+}
+
+pub async fn start_websocket(
+    api_key: &str,
+    tx: mpsc::Sender<WsEvent>,
+    mut cmd_rx: mpsc::Receiver<WsCommand>,
+    tui_state: Arc<crate::tui::TuiState>,
+) {
+    let ws_url = format!(
+        "wss://public-api.birdeye.so/socket/solana?x-api-key={}",
+        api_key
+    );
+
+    let max_retries = 3;
+    let mut attempt = 0;
 
     loop {
-        tracing::info!("📡 [WebSocket] Connecting to Birdeye WS...");
+        attempt += 1;
+        tui_state.log_scanner(&format!(
+            "📡 [WebSocket] Connecting to Birdeye BDS... (attempt {}/{})",
+            attempt, max_retries
+        ));
 
-        // Birdeye BDS requires specific headers for successful handshake
-        let request = http::Request::builder()
+        // Birdeye BDS requires these specific headers for handshake
+        let request = match http::Request::builder()
             .uri(&ws_url)
             .header("Origin", "ws://public-api.birdeye.so")
+            .header("Sec-WebSocket-Origin", "ws://public-api.birdeye.so")
             .header("Sec-WebSocket-Protocol", "echo-protocol")
             .body(())
-            .unwrap();
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tui_state.log_scanner(&format!("❌ [WebSocket] Failed to build request: {}", e));
+                break;
+            }
+        };
 
         match connect_async(request).await {
             Ok((ws_stream, _)) => {
-                tracing::info!("✅ [WebSocket] Connected to Birdeye successfully!");
+                tui_state.log_scanner("✅ [WebSocket] TCP handshake successful!");
                 let (mut write, mut read) = ws_stream.split();
                 use futures_util::SinkExt;
 
-                // Subscribe to Pump.fun tokens
+                // Reset retry counter on successful connect
+                attempt = 0;
+
+                // Subscribe to Pump.fun enriched meme tokens
                 let subscribe_msg = serde_json::json!({
                     "type": "SUBSCRIBE_MEME",
                     "data": {
@@ -86,55 +122,100 @@ pub async fn start_websocket(api_key: &str, tx: mpsc::Sender<WsEvent>, mut cmd_r
                     }
                 });
 
-                if let Err(e) = write.send(Message::Text(subscribe_msg.to_string().into())).await {
-                    tracing::error!("❌ [WebSocket] Subscription failed: {}", e);
+                if let Err(e) = write
+                    .send(Message::Text(subscribe_msg.to_string().into()))
+                    .await
+                {
+                    tui_state.log_scanner(&format!(
+                        "❌ [WebSocket] SUBSCRIBE_MEME send failed: {}",
+                        e
+                    ));
                     continue;
                 }
+                tui_state.log_scanner("📨 [WebSocket] Sent SUBSCRIBE_MEME (Pump.fun 50-100%)");
 
-                let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
+                // Heartbeat interval (30s ping-pong)
+                let mut heartbeat =
+                    tokio::time::interval(std::time::Duration::from_secs(30));
+
+                // Data timeout: if we don't receive any data within 60s after connecting,
+                // log a warning (likely Free tier) but keep the connection open
+                let mut received_any_data = false;
+                let connect_time = std::time::Instant::now();
+                let mut warned_no_data = false;
 
                 loop {
                     tokio::select! {
+                        // Heartbeat ping
                         _ = heartbeat.tick() => {
                             if let Err(e) = write.send(Message::Ping(vec![].into())).await {
-                                tracing::error!("❌ [WebSocket] Ping failed: {}", e);
+                                tui_state.log_scanner(&format!("❌ [WebSocket] Ping failed: {}", e));
                                 break;
                             }
+
+                            // Check if we've received data
+                            if !received_any_data && !warned_no_data && connect_time.elapsed().as_secs() > 60 {
+                                warned_no_data = true;
+                                tui_state.log_scanner(
+                                    "⚠️ [WebSocket] Connected but no data received (Business Package may be required). REST polling active as primary."
+                                );
+                            }
                         }
+
+                        // Incoming messages
                         msg = read.next() => {
                             let msg = match msg {
                                 Some(m) => m,
                                 None => {
-                                    tracing::warn!("⚠️ [WebSocket] Stream closed by server.");
+                                    tui_state.log_scanner("⚠️ [WebSocket] Stream closed by server.");
                                     break;
                                 }
                             };
                             match msg {
                                 Ok(Message::Text(text)) => {
-                                    if let Ok(event) = serde_json::from_str::<BirdeyeEvent>(&text) {
-                                        match event {
+                                    received_any_data = true;
+                                    match serde_json::from_str::<BirdeyeEvent>(&text) {
+                                        Ok(event) => match event {
                                             BirdeyeEvent::MemeData { data } => {
-                                                tracing::info!("🔔 [WS] Enriched Token Data for ${} ({})", data.symbol, data.address);
+                                                tui_state.log_scanner(&format!(
+                                                    "🔔 [WS] Enriched Meme: ${} | Liq: ${:.0} | Progress: {:.0}%",
+                                                    data.symbol, data.liquidity, data.meme_info.progress_percent
+                                                ));
                                                 let _ = tx.send(WsEvent::EnrichedMeme(data)).await;
                                             }
                                             BirdeyeEvent::PriceData { data } => {
-                                                // Handle price update
                                                 let _ = tx.send(WsEvent::PriceUpdate(data.address, data.c)).await;
                                             }
+                                            BirdeyeEvent::Welcome => {
+                                                tui_state.log_scanner("🤝 [WebSocket] Received WELCOME from Birdeye BDS");
+                                            }
                                             _ => {}
+                                        },
+                                        Err(_) => {
+                                            // Log unknown messages for debugging (truncated)
+                                            let preview: String = text.chars().take(120).collect();
+                                            tui_state.log_scanner(&format!(
+                                                "📩 [WS] Raw msg: {}...", preview
+                                            ));
                                         }
                                     }
                                 }
                                 Ok(Message::Pong(_)) => {
-                                    // Received pong, connection is alive
+                                    // Connection alive, heartbeat OK
+                                }
+                                Ok(Message::Ping(payload)) => {
+                                    // Server-initiated ping, respond with pong
+                                    let _ = write.send(Message::Pong(payload)).await;
                                 }
                                 Ok(Message::Close(_)) | Err(_) => {
-                                    tracing::warn!("⚠️ [WebSocket] Connection closed or error occurred.");
+                                    tui_state.log_scanner("⚠️ [WebSocket] Connection closed or error.");
                                     break;
                                 }
                                 _ => {}
                             }
                         }
+
+                        // Commands from executor (SUBSCRIBE_PRICE for active trades)
                         cmd = cmd_rx.recv() => {
                             if let Some(cmd) = cmd {
                                 match cmd {
@@ -142,15 +223,20 @@ pub async fn start_websocket(api_key: &str, tx: mpsc::Sender<WsEvent>, mut cmd_r
                                         let sub_msg = serde_json::json!({
                                             "type": "SUBSCRIBE_PRICE",
                                             "data": {
+                                                "queryType": "simple",
                                                 "chartType": "1m",
                                                 "currency": "usd",
                                                 "address": address
                                             }
                                         });
                                         if let Err(e) = write.send(Message::Text(sub_msg.to_string().into())).await {
-                                            tracing::error!("❌ [WebSocket] Failed to subscribe to price: {}", e);
+                                            tui_state.log_scanner(&format!(
+                                                "❌ [WS] SUBSCRIBE_PRICE failed: {}", e
+                                            ));
                                         } else {
-                                            tracing::info!("📡 [WebSocket] Sent SUBSCRIBE_PRICE for {}", address);
+                                            tui_state.log_scanner(&format!(
+                                                "📡 [WS] Subscribed PRICE for {}", &address[..8.min(address.len())]
+                                            ));
                                         }
                                     }
                                 }
@@ -160,12 +246,26 @@ pub async fn start_websocket(api_key: &str, tx: mpsc::Sender<WsEvent>, mut cmd_r
                 }
             }
             Err(e) => {
-                tracing::error!("❌ [WebSocket] Birdeye WS connection failed: {}", e);
+                tui_state.log_scanner(&format!(
+                    "❌ [WebSocket] Connection failed: {}", e
+                ));
             }
         }
 
-        tracing::info!("🔄 [WebSocket] Reconnecting in 5s...");
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        // Retry logic with limit
+        if attempt >= max_retries {
+            tui_state.log_scanner(&format!(
+                "⚠️ [WebSocket] {} attempts failed. WebSocket paused — REST polling is primary data source. Will retry in 5 min.",
+                max_retries
+            ));
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            attempt = 0; // Reset for another round after 5 min
+        } else {
+            let delay = 5 * attempt as u64;
+            tui_state.log_scanner(&format!(
+                "🔄 [WebSocket] Reconnecting in {}s...", delay
+            ));
+            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+        }
     }
 }
-

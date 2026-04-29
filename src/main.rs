@@ -62,14 +62,15 @@ async fn main() {
 
     // Start WebSocket in background
     let api_key = config.birdeye_api_key.clone();
+    let tui_state_ws = tui_state.clone();
     tokio::spawn(async move {
-        start_websocket(&api_key, ws_tx, ws_cmd_rx).await;
+        start_websocket(&api_key, ws_tx, ws_cmd_rx, tui_state_ws).await;
     });
 
     let max_trades = config.max_active_trades;
-    let mut scan_interval = tokio::time::interval(std::time::Duration::from_secs(45));
+    let mut scan_interval = tokio::time::interval(std::time::Duration::from_secs(30));
 
-    tui_state.log_scanner("🚀 HawkEye Shield Started! (WebSocket + Polling every 45s)");
+    tui_state.log_scanner("🚀 HawkEye Shield Started! (WebSocket + REST Polling every 30s)");
 
     loop {
         tokio::select! {
