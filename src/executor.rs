@@ -425,14 +425,32 @@ impl TradeExecutor {
         // Subscribe to real-time price updates via WebSocket!
         let _ = self.ws_cmd_tx.send(WsCommand::SubscribePrice(address.clone())).await;
 
+        let jup_client = reqwest::Client::new();
+
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
             // Read the latest price that the WebSocket injected
             {
+                let trades = self.active_trades.lock().await;
+                if let Some(trade) = trades.get(&address) {
+                    current_price = trade.current_price;
+                }
+            }
+
+            // Fallback: Ping Jupiter Price API (100% Free, 0 CU)
+            if let Ok(resp) = jup_client.get(format!("https://api.jup.ag/price/v2?ids={}", address)).send().await {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    if let Some(p) = body["data"][&address]["price"].as_str().and_then(|p| p.parse::<f64>().ok()) {
+                        if p > 0.0 { current_price = p; }
+                    }
+                }
+            }
+
+            {
                 let mut trades = self.active_trades.lock().await;
                 if let Some(trade) = trades.get_mut(&address) {
-                    current_price = trade.current_price;
+                    trade.current_price = current_price;
                     
                     let pnl_pct_calc = if buy_price > 0.0 {
                         ((current_price - buy_price) / buy_price) * 100.0
