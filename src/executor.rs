@@ -165,14 +165,9 @@ impl TradeExecutor {
         0.0
     }
 
-    /// Refresh token price via Birdeye (primary) + Jupiter (fallback)
+    /// Refresh token price via Jupiter (primary, FREE) + Birdeye (fallback)
     async fn refresh_price(&self, address: &str) -> Option<f64> {
-        // Primary: Birdeye
-        if let Ok(price) = self.birdeye.get_price(address).await {
-            if price > 0.0 { return Some(price); }
-        }
-
-        // Fallback: Jupiter Price API
+        // Primary: Jupiter Price API
         let client = reqwest::Client::new();
         if let Ok(resp) = client.get(format!("https://api.jup.ag/price/v2?ids={}", address))
             .send().await
@@ -184,6 +179,11 @@ impl TradeExecutor {
                     if price > 0.0 { return Some(price); }
                 }
             }
+        }
+
+        // Fallback: Birdeye (Costs CU)
+        if let Ok(price) = self.birdeye.get_price(address).await {
+            if price > 0.0 { return Some(price); }
         }
 
         None

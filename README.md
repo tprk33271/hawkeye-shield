@@ -12,9 +12,9 @@
 
 ## 🎬 Live Demonstration
 
-<video src="https://github.com/tprk33271/hawkeye-shield/raw/main/assets/demo.mp4" controls="controls" muted="muted" playsinline="playsinline" style="max-width: 100%;"></video>
+![30-Second Live Action Demo](./assets/demo.gif)
 
-> **[Can't see the video? Click here to download/view the MP4 file directly](https://github.com/tprk33271/hawkeye-shield/raw/main/assets/demo.mp4)**
+> **[Watch full resolution MP4 here](./assets/demo.mp4)**
 
 ---
 
