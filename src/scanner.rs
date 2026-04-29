@@ -307,7 +307,7 @@ impl Scanner {
                             return (None, None);
                         }
 
-                        let is_healthy_momentum = m5_buys > (overview.sell_5m as f64 * 1.1) as u64 && m5_volume > 200.0;
+                        let is_healthy_momentum = m5_buys >= overview.sell_5m && m5_volume > 100.0;
                         let strategy = Scanner::match_strategy_static(
                             paper_trade, age_minutes, is_healthy_momentum, liquidity,
                             price_change_m5, m5_volume, &overview
@@ -391,11 +391,11 @@ impl Scanner {
         let h1_volume = overview.volume_1h;
         let avg_m5_from_h1 = if h1_volume > 0.0 { h1_volume / 12.0 } else { 0.0 };
         let is_volume_spiking = avg_m5_from_h1 > 0.0 && m5_volume > (avg_m5_from_h1 * 1.5);
-        // Thresholds (Strict Meme Sniper requirements)
-        let min_liq_new = 4000.0;
-        let min_liq_old = 10000.0;
-        let min_m5_pct = 3.0; // Must pump at least 3% in 5m
-        let min_h1_pct = 10.0; // Must be up at least 10% in 1h
+        // Thresholds (Balanced: catch opportunities while filtering junk)
+        let min_liq_new = 2000.0;
+        let min_liq_old = 5000.0;
+        let min_m5_pct = 1.0; // Must pump at least 1% in 5m
+        let min_h1_pct = 5.0; // Must be up at least 5% in 1h
 
         // ═══ STRATEGY 1: Early Momentum (New Token < 2h) ═══
         if age_minutes >= 2.0 && age_minutes <= 120.0 {
@@ -425,8 +425,13 @@ impl Scanner {
         }
 
         // ═══ STRATEGY 5: Fresh Pump (Brand new token with aggressive positive momentum) ═══
-        if age_minutes < 30.0 && liquidity > min_liq_new && price_change_m5 > 3.0 && m5_volume > 500.0 {
+        if age_minutes < 30.0 && liquidity > min_liq_new && price_change_m5 > 2.0 && m5_volume > 300.0 {
             return Some(format!("🔥 Fresh Pump (Age: {:.0}m, 5m: +{:.1}%)", age_minutes, price_change_m5));
+        }
+
+        // ═══ STRATEGY 6: Active Trading (Any token with positive movement and decent activity) ═══
+        if liquidity > min_liq_new && price_change_m5 > 0.5 && m5_volume > 100.0 && is_healthy_momentum {
+            return Some(format!("📈 Active Trading (5m: +{:.1}%, Vol: ${:.0})", price_change_m5, m5_volume));
         }
 
         None
