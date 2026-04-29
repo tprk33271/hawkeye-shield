@@ -1,7 +1,9 @@
-use crate::birdeye::{BirdeyeClient, TokenOverview};
+use crate::birdeye::{BirdeyeClient, TokenOverview, TrendingToken, NewListing};
 use crate::config::Config;
 use std::collections::HashMap;
 use std::time::Instant;
+use std::sync::Arc;
+use tokio::sync::Mutex as TokioMutex;
 
 // ============================================================
 // Scanner — Token Discovery + Filtering Engine
@@ -27,11 +29,12 @@ pub struct Scanner {
     scanned_cache: HashMap<String, Instant>,     // cooldown 2 min
     safety_blacklist: HashMap<String, Instant>,   // blacklist 1 hour
     trade_blacklist: HashMap<String, (u32, Instant)>, // (loss_count, release_at)
-    tui_state: std::sync::Arc<crate::tui::TuiState>,
+    tui_state: Arc<crate::tui::TuiState>,
+    pub ws_buffer: Arc<TokioMutex<Vec<String>>>,
 }
 
 impl Scanner {
-    pub fn new(birdeye: BirdeyeClient, config: Config, tui_state: std::sync::Arc<crate::tui::TuiState>) -> Self {
+    pub fn new(birdeye: BirdeyeClient, config: Config, tui_state: Arc<crate::tui::TuiState>) -> Self {
         Self {
             birdeye,
             config,
@@ -39,6 +42,7 @@ impl Scanner {
             safety_blacklist: HashMap::new(),
             trade_blacklist: HashMap::new(),
             tui_state,
+            ws_buffer: Arc::new(TokioMutex::new(Vec::new())),
         }
     }
 
@@ -95,6 +99,15 @@ impl Scanner {
 
         let mut addresses: Vec<String> = Vec::new();
         
+        // Take from WebSocket buffer - REAL TIME SIGNALS
+        {
+            let mut buffer = self.ws_buffer.lock().await;
+            for addr in buffer.iter() {
+                if !addresses.contains(addr) { addresses.push(addr.clone()); }
+            }
+            buffer.clear(); // Clear after processing
+        }
+
         // Take top from trending - FILTER EARLY to save CU
         for t in trending.iter().take(10) {
             if t.liquidity.unwrap_or(0.0) < 3000.0 { continue; } // Skip dead ones immediately
@@ -130,6 +143,9 @@ impl Scanner {
 
             self.scanned_cache.insert(address.clone(), now);
             addresses_to_scan.push(address.clone());
+            
+            // Safety cap: Never scan more than 15 tokens per cycle to respect CU limits
+            if addresses_to_scan.len() >= 15 { break; }
         }
 
         use futures_util::stream::{self, StreamExt};
@@ -382,63 +398,5 @@ impl Scanner {
 
         tui_state.log_scanner(&format!("  ✅ ${} Passed safety checks (Birdeye Security)", address));
         Ok(true)
-    }
-
-    /// Scan a single token (for real-time sniper)
-    pub async fn scan_single(&mut self, address: &str) -> Option<TokenCandidate> {
-        if self.scanned_cache.contains_key(address) {
-            return None;
-        }
-
-        match self.birdeye.get_token_overview(address).await {
-            Ok(overview) => {
-                let age_minutes = overview.created_at
-                    .map(|ts| (chrono::Utc::now().timestamp() - ts) as f64 / 60.0)
-                    .unwrap_or(0.0);
-                let liquidity = overview.liquidity;
-                let m5_volume = overview.volume_5m;
-                let m5_buys = overview.buy_5m;
-                let m5_sells = overview.sell_5m;
-                let price_change_m5 = overview.price_change_5m;
-
-                // Anti-Wash Trade
-                let avg_buy_size = if m5_buys > 0 { m5_volume / m5_buys as f64 } else { 0.0 };
-                if m5_buys < 30 && avg_buy_size > 500.0 {
-                    return None;
-                }
-
-                let is_healthy_momentum = m5_buys > (m5_sells as f64 * 1.2) as u64 && m5_volume > 500.0;
-
-                if let Some(strategy) = Scanner::match_strategy_static(self.config.paper_trade, age_minutes, is_healthy_momentum, liquidity, price_change_m5, m5_volume, &overview) {
-                    // Safety check
-                    if !self.config.paper_trade {
-                        match Scanner::check_safety_static(&self.birdeye, &self.tui_state, address, age_minutes).await {
-                            Ok(true) => {},
-                            _ => {
-                                self.safety_blacklist.insert(address.to_string(), Instant::now());
-                                return None;
-                            }
-                        }
-                    }
-
-                    let candidate = TokenCandidate {
-                        address: address.to_string(),
-                        symbol: overview.symbol.clone(),
-                        name: overview.name.clone(),
-                        price: overview.price,
-                        liquidity,
-                        volume_5m: m5_volume,
-                        price_change_m5,
-                        strategy,
-                    };
-
-                    self.scanned_cache.insert(address.to_string(), Instant::now());
-                    Some(candidate)
-                } else {
-                    None
-                }
-            }
-            Err(_) => None,
-        }
     }
 }

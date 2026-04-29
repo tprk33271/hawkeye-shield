@@ -79,16 +79,18 @@ async fn main() {
                     WsEvent::NewPairRaydium(sig) => {
                         if let Some(mint) = executor.fetch_mint_from_sig(&sig, crate::executor::NewPairType::Raydium).await {
                             tui_state.log_scanner(&format!("🔔 [WS] New Raydium Pool: {}", mint));
-                            if let Some(token) = scanner.scan_single(&mint).await {
-                                handle_buy(token, &executor, &config, &birdeye, &shared_trades, &tui_state).await;
+                            let mut buffer = scanner.ws_buffer.lock().await;
+                            if !buffer.contains(&mint) {
+                                buffer.push(mint);
                             }
                         }
                     }
                     WsEvent::NewPairPumpFun(sig) => {
                         if let Some(mint) = executor.fetch_mint_from_sig(&sig, crate::executor::NewPairType::PumpFun).await {
                             tui_state.log_scanner(&format!("💊 [WS] New Pump.fun: {}", mint));
-                            if let Some(token) = scanner.scan_single(&mint).await {
-                                handle_buy(token, &executor, &config, &birdeye, &shared_trades, &tui_state).await;
+                            let mut buffer = scanner.ws_buffer.lock().await;
+                            if !buffer.contains(&mint) {
+                                buffer.push(mint);
                             }
                         }
                     }
