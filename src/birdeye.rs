@@ -53,6 +53,15 @@ impl BirdeyeClient {
             }
 
             let body_text = resp.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            
+            // Handle Birdeye-specific Compute Unit limits returned as 400 Bad Request
+            if status == reqwest::StatusCode::BAD_REQUEST && body_text.contains("Compute units usage limit exceeded") && attempts < max_attempts {
+                attempts += 1;
+                tokio::time::sleep(delay * 2).await; // Longer delay for CU limits
+                delay *= 2;
+                continue;
+            }
+
             return Err(format!("API Error {}: {}", status, body_text));
         }
     }

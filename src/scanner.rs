@@ -97,17 +97,17 @@ impl Scanner {
         let mut addresses: Vec<String> = Vec::new();
         
         // Take top from trending
-        for t in trending.iter().take(15) {
+        for t in trending.iter().take(5) {
             if !addresses.contains(&t.address) { addresses.push(t.address.clone()); }
         }
         
         // Take top from new listings
-        for n in new_listings.iter().take(15) {
+        for n in new_listings.iter().take(5) {
             if !addresses.contains(&n.address) { addresses.push(n.address.clone()); }
         }
 
         // Take top from Meme List V3
-        for m in meme_list.iter().take(10) {
+        for m in meme_list.iter().take(5) {
             if !addresses.contains(&m.address) { addresses.push(m.address.clone()); }
         }
 
@@ -265,10 +265,8 @@ impl Scanner {
                     price_change_m5,
                     strategy,
                 };
-                
-                (Some(candidate), None)
             }
-        }).buffer_unordered(2);
+        }).buffer_unordered(1); // SEQUENTIAL ONLY to prevent Compute Unit limit explosion
 
         let mut candidates = Vec::new();
         while let Some((candidate_opt, blacklist_opt)) = stream.next().await {
