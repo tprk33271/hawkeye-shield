@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
+use crate::websocket::WsCommand;
 
 // ============================================================
 // Trade Executor — Buy/Sell via Jupiter + Position Management
@@ -41,12 +43,13 @@ pub struct TradeExecutor {
     pub active_trades: Arc<Mutex<HashMap<String, ActiveTrade>>>,
     jup_base: String,
     pub tui_state: std::sync::Arc<crate::tui::TuiState>,
+    ws_cmd_tx: mpsc::Sender<WsCommand>,
 }
 
 
 
 impl TradeExecutor {
-    pub fn new(config: Config, birdeye: BirdeyeClient, active_trades: Arc<Mutex<HashMap<String, ActiveTrade>>>, tui_state: std::sync::Arc<crate::tui::TuiState>) -> Self {
+    pub fn new(config: Config, birdeye: BirdeyeClient, active_trades: Arc<Mutex<HashMap<String, ActiveTrade>>>, tui_state: std::sync::Arc<crate::tui::TuiState>, ws_cmd_tx: mpsc::Sender<WsCommand>) -> Self {
         let read_rpc = RpcClient::new_with_commitment(
             config.solana_rpc_url.clone(),
             CommitmentConfig::confirmed(),
@@ -70,6 +73,7 @@ impl TradeExecutor {
             active_trades,
             jup_base,
             tui_state,
+            ws_cmd_tx,
         }
     }
 
@@ -417,12 +421,32 @@ impl TradeExecutor {
         }
 
         self.tui_state.log_trade(&format!("🔔 [Monitor] Monitoring ${} (Entry: ${:.8}, Stop: ${:.8})", symbol, buy_price, stop_price));
+        
+        // Subscribe to real-time price updates via WebSocket!
+        let _ = self.ws_cmd_tx.send(WsCommand::SubscribePrice(address.clone())).await;
 
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-            if let Some(price) = self.refresh_price(&address).await {
-                current_price = price;
+            // Read the latest price that the WebSocket injected
+            {
+                let mut trades = self.active_trades.lock().await;
+                if let Some(trade) = trades.get_mut(&address) {
+                    current_price = trade.current_price;
+                    
+                    let pnl_pct_calc = if buy_price > 0.0 {
+                        ((current_price - buy_price) / buy_price) * 100.0
+                    } else {
+                        0.0
+                    };
+                    let pnl_pct_calc = if pnl_pct_calc.is_nan() || pnl_pct_calc.is_infinite() { 0.0 } else { pnl_pct_calc };
+
+                    trade.pnl_pct = pnl_pct_calc;
+                    trade.stop_price = stop_price;
+                    trade.tp1_hit = tp1_hit;
+                    trade.break_even_hit = break_even_hit;
+                    trade.highest_price = highest_price;
+                }
             }
 
             let pnl_pct = if buy_price > 0.0 {
@@ -432,19 +456,6 @@ impl TradeExecutor {
             };
             let pnl_pct = if pnl_pct.is_nan() || pnl_pct.is_infinite() { 0.0 } else { pnl_pct };
             let elapsed_ms = start.elapsed().as_millis();
-
-            // Update active trade state
-            {
-                let mut trades = self.active_trades.lock().await;
-                if let Some(trade) = trades.get_mut(&address) {
-                    trade.current_price = current_price;
-                    trade.pnl_pct = pnl_pct;
-                    trade.stop_price = stop_price;
-                    trade.tp1_hit = tp1_hit;
-                    trade.break_even_hit = break_even_hit;
-                    trade.highest_price = highest_price;
-                }
-            }
 
             // Print beautiful PNL log every ~10 seconds
             // (Removed PNL Tracker logging here since the TUI active trades table handles it)

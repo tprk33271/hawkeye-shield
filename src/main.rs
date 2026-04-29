@@ -11,7 +11,7 @@ use crate::config::Config;
 use crate::executor::TradeExecutor;
 use crate::scanner::Scanner;
 use crate::tui::{run_tui, TuiState};
-use crate::websocket::{start_websocket, WsEvent};
+use crate::websocket::{start_websocket, WsEvent, WsCommand};
 use tokio::sync::mpsc;
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -53,7 +53,9 @@ async fn main() {
         }
     });
 
-    let executor = TradeExecutor::new(config.clone(), birdeye.clone(), shared_trades.clone(), tui_state.clone());
+    let (ws_cmd_tx, ws_cmd_rx) = mpsc::channel::<WsCommand>(100);
+
+    let executor = TradeExecutor::new(config.clone(), birdeye.clone(), shared_trades.clone(), tui_state.clone(), ws_cmd_tx.clone());
     let mut scanner = Scanner::new(birdeye.clone(), config.clone(), tui_state.clone());
 
     let (ws_tx, mut ws_rx) = mpsc::channel::<WsEvent>(100);
@@ -61,7 +63,7 @@ async fn main() {
     // Start WebSocket in background
     let api_key = config.birdeye_api_key.clone();
     tokio::spawn(async move {
-        start_websocket(&api_key, ws_tx).await;
+        start_websocket(&api_key, ws_tx, ws_cmd_rx).await;
     });
 
     let max_trades = config.max_active_trades;
@@ -82,6 +84,12 @@ async fn main() {
                         // Avoid duplicates in buffer
                         if !buffer.iter().any(|d| d.address == data.address) {
                             buffer.push(data);
+                        }
+                    }
+                    WsEvent::PriceUpdate(address, price) => {
+                        let mut trades = shared_trades.lock().await;
+                        if let Some(trade) = trades.get_mut(&address) {
+                            trade.current_price = price;
                         }
                     }
                 }
@@ -107,7 +115,7 @@ async fn main() {
                     .keys().cloned().collect();
 
                 if let Some(token) = scanner.scan_for_opportunities(&active_addresses).await {
-                    handle_buy(token, &executor, &config, &birdeye, &shared_trades, &tui_state).await;
+                    handle_buy(token, &executor, &config, &birdeye, &shared_trades, &tui_state, &ws_cmd_tx).await;
                 }
             }
         }
@@ -120,7 +128,8 @@ async fn handle_buy(
     config: &Config,
     birdeye: &BirdeyeClient,
     shared_trades: &Arc<tokio::sync::Mutex<HashMap<String, crate::executor::ActiveTrade>>>,
-    tui_state: &Arc<TuiState>
+    tui_state: &Arc<TuiState>,
+    ws_cmd_tx: &mpsc::Sender<WsCommand>
 ) {
     let balance = tui_state.balance.lock().unwrap().clone();
     let trade_size = if config.use_dynamic_sizing && balance > 0.0 {
@@ -142,9 +151,10 @@ async fn handle_buy(
             let config_clone = config.clone();
             let shared_trades_clone = shared_trades.clone();
             let tui_state_monitor = tui_state.clone();
+            let ws_cmd_tx_clone = ws_cmd_tx.clone();
 
             tokio::spawn(async move {
-                let monitor_executor = TradeExecutor::new(config_clone, birdeye_clone, shared_trades_clone, tui_state_monitor.clone());
+                let monitor_executor = TradeExecutor::new(config_clone, birdeye_clone, shared_trades_clone, tui_state_monitor.clone(), ws_cmd_tx_clone);
                 let pnl = monitor_executor.monitor_and_sell(token_clone, buy_price, spent).await;
                 tui_state_monitor.log_trade(&format!("📊 [Trade Complete] PNL: {:.2}%", pnl));
             });
