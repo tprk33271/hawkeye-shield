@@ -160,12 +160,13 @@ HawkEye Shield implements a multi-layer risk management system:
 - **Birdeye Security:** Top 10 holders < 30-40%, not mintable, not freezable
 
 ### Position Management
-1. **Stop-Loss:** -12% (configurable)
-2. **Break-Even Lock:** At +20%, move stop to +5%
-3. **TP1 (Pull Capital):** At +40%, sell 50% to secure capital
-4. **Trailing Stop:** After TP1, trail at 75% of highest price
-5. **Hard Stop:** -50% emergency exit
-6. **Timeout:** 15-minute max hold
+1. **Position Sizing:** Dual-mode sizing. Defaults to Dynamic Sizing (Kelly Fraction, e.g., 15% of portfolio) or Fixed Amount (e.g., 0.05 SOL).
+2. **Stop-Loss:** -12% (configurable)
+3. **Break-Even Lock:** At +20%, move stop to +5%
+4. **TP1 (Pull Capital):** At +40%, sell 50% to secure capital
+5. **Trailing Stop:** After TP1, trail at 75% of highest price
+6. **Hard Stop:** -50% emergency exit
+7. **Timeout:** 15-minute max hold
 
 ---
 
