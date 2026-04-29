@@ -187,7 +187,7 @@ impl Scanner {
                 }
 
                 // ═══ HARD FILTERS (don't rely on Security API) ═══
-                if liquidity < 500.0 {
+                if liquidity < 4000.0 {
                     tui_state.log_scanner(&format!("  🛑 ${} skip: Low Liquidity (${:.0})", overview.symbol, liquidity));
                     return (None, None);
                 }
@@ -197,7 +197,7 @@ impl Scanner {
                     return (None, None);
                 }
 
-                if overview.volume_24h < 500.0 {
+                if overview.volume_24h < 3000.0 {
                     tui_state.log_scanner(&format!("  🛑 ${} skip: Dead volume (24h: ${:.0})", overview.symbol, overview.volume_24h));
                     return (None, None);
                 }
@@ -311,8 +311,8 @@ impl Scanner {
         let is_volume_spiking = avg_m5_from_h1 > 0.0 && m5_volume > (avg_m5_from_h1 * 1.5);
 
         // Thresholds (unified — Paper = Live)
-        let min_liq_new = 500.0;
-        let min_liq_old = 2000.0;
+        let min_liq_new = 4000.0;
+        let min_liq_old = 10000.0;
         let min_m5_pct = 1.5;
         let min_h1_pct = 2.0;
 
