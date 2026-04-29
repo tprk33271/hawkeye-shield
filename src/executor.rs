@@ -391,7 +391,7 @@ impl TradeExecutor {
         let address = token.address.clone();
         let symbol = token.symbol.clone();
         let start = std::time::Instant::now();
-        let max_monitor_ms: u128 = 5 * 60 * 1000;
+        let max_monitor_ms: u128 = 15 * 60 * 1000;
 
         let stop_loss_pct = self.config.stop_loss_pct;
         let take_profit_pct = self.config.take_profit_pct;

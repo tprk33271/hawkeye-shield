@@ -81,7 +81,7 @@ HawkEye Shield employs a complex, non-linear exit strategy designed to eliminate
 2. **Break-Even Lock (Risk-Free Mode):** The moment a token hits +20%, the system overrides the Stop-Loss, moving it up to +5%. This permanently locks in a risk-free trade.
 3. **TP1 (Capital Recovery):** Upon reaching +40%, the bot executes a partial sell (exactly 50% of holdings). This completely recovers the initial investment and gas fees.
 4. **Dynamic Trailing Moonbag:** After TP1, the remaining tokens enter "moonbag" mode. The bot establishes a dynamic trailing stop pegged to 75% of the token's *Highest Recorded Price*. As the price climbs, the stop-loss climbs with it, securing maximum upside while defending against sudden rug-pulls.
-5. **Time-Based Capitulation:** If a token stalls and fails to reach +20% within **5 minutes** (300 seconds), the bot autonomously executes a market sell to free up trapped capital for higher-velocity opportunities.
+5. **Time-Based Capitulation:** If a token stalls and fails to reach +20% within **15 minutes** (900 seconds), the bot autonomously executes a market sell to free up trapped capital for higher-velocity opportunities.
 
 ---
 
