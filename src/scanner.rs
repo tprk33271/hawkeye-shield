@@ -1,4 +1,4 @@
-use crate::birdeye::{BirdeyeClient, TokenOverview, TrendingToken, NewListing};
+use crate::birdeye::{BirdeyeClient, TokenOverview};
 use crate::config::Config;
 use std::collections::HashMap;
 use std::time::Instant;
