@@ -93,16 +93,17 @@ impl Scanner {
             }
         };
 
-        // Merge unique addresses (Trending + New + Meme V3)
         let mut addresses: Vec<String> = Vec::new();
         
-        // Take top from trending
-        for t in trending.iter().take(5) {
+        // Take top from trending - FILTER EARLY to save CU
+        for t in trending.iter().take(10) {
+            if t.liquidity.unwrap_or(0.0) < 3000.0 { continue; } // Skip dead ones immediately
             if !addresses.contains(&t.address) { addresses.push(t.address.clone()); }
         }
         
-        // Take top from new listings
-        for n in new_listings.iter().take(5) {
+        // Take top from new listings - FILTER EARLY
+        for n in new_listings.iter().take(10) {
+            if n.liquidity.unwrap_or(0.0) < 2000.0 { continue; }
             if !addresses.contains(&n.address) { addresses.push(n.address.clone()); }
         }
 
@@ -141,8 +142,8 @@ impl Scanner {
             
             async move {
                 // Add a small delay to avoid hitting rate limit burst (max 5 requests per second)
-                // Using 600ms because we run with buffer_unordered(2)
-                tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                // Sequential processing with 1.2s delay to keep CU usage low and steady
+                tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
 
                 // Fetch detailed data from Birdeye
                 let mut overview = match birdeye.get_token_overview(&address).await {
