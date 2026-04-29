@@ -227,10 +227,18 @@ impl TradeExecutor {
             }
         }
 
-        let quote: serde_json::Value = client.get(&quote_url)
+        let quote_resp = client.get(&quote_url)
             .headers(headers.clone())
-            .send().await.map_err(|e| e.to_string())?
-            .json().await.map_err(|e| e.to_string())?;
+            .send().await.map_err(|e| format!("Quote request failed: {}", e))?;
+
+        let status = quote_resp.status();
+        if !status.is_success() {
+            let err_text = quote_resp.text().await.unwrap_or_default();
+            return Err(format!("Jupiter Quote HTTP {}: {}", status, err_text));
+        }
+
+        let quote: serde_json::Value = quote_resp.json().await
+            .map_err(|e| format!("Quote JSON decode error: {}", e))?;
 
         if quote.get("error").is_some() || quote.get("errorCode").is_some() {
             return Err(format!("Jupiter quote error: {:?}", quote));
@@ -246,13 +254,22 @@ impl TradeExecutor {
                 "prioritizationFeeLamports": (self.config.priority_fee_micro_lamports / 1000)
             });
             let swap_url = format!("{}/swap", self.jup_base);
-            let swap_resp: serde_json::Value = client.post(&swap_url)
+            let swap_resp_raw = client.post(&swap_url)
                 .headers(headers.clone())
                 .json(&swap_body)
-                .send().await.map_err(|e| e.to_string())?
-                .json().await.map_err(|e| e.to_string())?;
+                .send().await.map_err(|e| format!("Swap request failed: {}", e))?;
+            
+            let swap_status = swap_resp_raw.status();
+            if !swap_status.is_success() {
+                let err_text = swap_resp_raw.text().await.unwrap_or_default();
+                return Err(format!("Jupiter Swap HTTP {}: {}", swap_status, err_text));
+            }
+
+            let swap_resp: serde_json::Value = swap_resp_raw.json().await
+                .map_err(|e| format!("Swap JSON decode error: {}", e))?;
+
             swap_resp["swapTransaction"].as_str()
-                .ok_or("No swapTransaction in response")?.to_string()
+                .ok_or_else(|| format!("No swapTransaction in response: {:?}", swap_resp))?.to_string()
         };
 
         let tx_bytes = base64::engine::general_purpose::STANDARD
