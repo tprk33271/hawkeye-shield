@@ -60,7 +60,15 @@ pub async fn start_websocket(api_key: &str, tx: mpsc::Sender<WsEvent>, mut cmd_r
     loop {
         tracing::info!("📡 [WebSocket] Connecting to Birdeye WS...");
 
-        match connect_async(&ws_url).await {
+        // Birdeye BDS requires specific headers for successful handshake
+        let request = http::Request::builder()
+            .uri(&ws_url)
+            .header("Origin", "ws://public-api.birdeye.so")
+            .header("Sec-WebSocket-Protocol", "echo-protocol")
+            .body(())
+            .unwrap();
+
+        match connect_async(request).await {
             Ok((ws_stream, _)) => {
                 tracing::info!("✅ [WebSocket] Connected to Birdeye successfully!");
                 let (mut write, mut read) = ws_stream.split();
@@ -83,8 +91,16 @@ pub async fn start_websocket(api_key: &str, tx: mpsc::Sender<WsEvent>, mut cmd_r
                     continue;
                 }
 
+                let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
+
                 loop {
                     tokio::select! {
+                        _ = heartbeat.tick() => {
+                            if let Err(e) = write.send(Message::Ping(vec![].into())).await {
+                                tracing::error!("❌ [WebSocket] Ping failed: {}", e);
+                                break;
+                            }
+                        }
                         msg = read.next() => {
                             let msg = match msg {
                                 Some(m) => m,
@@ -108,6 +124,9 @@ pub async fn start_websocket(api_key: &str, tx: mpsc::Sender<WsEvent>, mut cmd_r
                                             _ => {}
                                         }
                                     }
+                                }
+                                Ok(Message::Pong(_)) => {
+                                    // Received pong, connection is alive
                                 }
                                 Ok(Message::Close(_)) | Err(_) => {
                                     tracing::warn!("⚠️ [WebSocket] Connection closed or error occurred.");

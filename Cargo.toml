@@ -24,6 +24,7 @@ futures-util = "0.3"
 url = "2.5"
 ratatui = "0.26"
 crossterm = "0.27"
+http = "1.1"
 
 [profile.release]
 opt-level = 3

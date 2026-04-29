@@ -1585,6 +1585,7 @@ dependencies = [
  "crossterm",
  "dotenv",
  "futures-util",
+ "http 1.4.0",
  "ratatui",
  "reqwest",
  "serde",
