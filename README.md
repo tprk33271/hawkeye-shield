@@ -154,8 +154,8 @@ PAPER_TRADE=true
 HawkEye Shield implements a multi-layer risk management system:
 
 ### Entry Filters
-- **Minimum Liquidity:** $10,000+ (new tokens) / $12,000+ (legacy)
-- **Buy/Sell Ratio:** Buys must be 1.5x Sells in last 5 minutes
+- **Minimum Liquidity:** $500+ (new tokens) / $2,000+ (legacy)
+- **Buy/Sell Ratio:** Buys must be 1.2x Sells in last 5 minutes
 - **Anti-Wash Trade:** Detects fake volume (low buys + high avg size)
 - **Birdeye Security:** Top 10 holders < 30-40%, not mintable, not freezable
 
