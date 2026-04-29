@@ -220,8 +220,8 @@ impl Scanner {
                         }), None)
                     }
                     ScanJob::Address(address) => {
-                        // Add a longer delay for REST path to prevent CU exhaustion
-                        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+                        // Short delay between REST calls to prevent CU exhaustion
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
                         // Fetch detailed data from Birdeye
                         let mut overview = match birdeye.get_token_overview(&address).await {
@@ -240,21 +240,8 @@ impl Scanner {
                             return (None, Some(address.clone()));
                         }
 
-                        let now_utc = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
-                        let age_minutes = (now_utc - overview.created_at.unwrap_or(now_utc)) as f64 / 60.0;
-
-                        // Check static safety (Top 10 holders, Dev percentage, etc.)
-                        let is_safe = match Self::check_safety_static(&birdeye, &tui_state, &address, age_minutes).await {
-                            Ok(safe) => safe,
-                            Err(e) => {
-                                debug_log(&format!("SAFETY_ERROR {} - {}", address, e));
-                                return (None, Some(address.clone()));
-                            }
-                        };
-
-                        if !is_safe {
-                            return (None, Some(address.clone()));
-                        }
+                        // Safety check moved below strategy match to avoid wasting CU
+                        // on tokens that won't pass strategy filters anyway
 
                         // Enrich with Trending API data
                         if let Some(t) = trending.iter().find(|t| &t.address == &address) {
@@ -349,8 +336,8 @@ impl Scanner {
                     }
                 }
             }
-        // Process sequentially (1) or at most 2 to avoid Birdeye CU limits
-        }).buffer_unordered(1);
+        // Process 2 tokens concurrently (balanced speed vs CU usage)
+        }).buffer_unordered(2);
 
         let mut candidates = Vec::new();
         while let Some((candidate_opt, blacklist_opt)) = combined_stream.next().await {
