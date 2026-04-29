@@ -75,12 +75,13 @@ HawkEye Shield implements a multi-layer risk management system adapted from inst
 - **Dynamic Kelly Fraction:** Buys using a percentage of your current wallet balance (e.g., 15%). As your portfolio grows, your trade sizes scale automatically.
 - **Fixed Allocation:** Optionally bypass dynamic sizing to buy an exact, fixed amount of SOL per trade.
 
-### 4. Lifecycle Management
-1. **Stop-Loss:** Triggers an emergency sell at -12% (configurable).
-2. **Break-Even Lock:** If the token hits +20%, the stop-loss is automatically moved to +5% to guarantee a risk-free trade.
-3. **Take Profit 1 (Pull Capital):** At +40%, the bot sells exactly 50% of the holdings to secure the initial capital.
-4. **Trailing Stop:** After TP1 is hit, the remaining "moonbag" trails at 75% of the highest recorded price.
-5. **Hard Timeout:** If a token goes nowhere after 15 minutes, the bot closes the position to free up capital.
+### 4. Dynamic Trailing Take-Profit (Capital Preservation Engine)
+HawkEye Shield employs a complex, non-linear exit strategy designed to eliminate emotional trading and mathematically secure profits while letting runners run:
+1. **Hard Stop-Loss:** Triggers a surgical exit at -12% (configurable) to cut losses instantly.
+2. **Break-Even Lock (Risk-Free Mode):** The moment a token hits +20%, the system overrides the Stop-Loss, moving it up to +5%. This permanently locks in a risk-free trade.
+3. **TP1 (Capital Recovery):** Upon reaching +40%, the bot executes a partial sell (exactly 50% of holdings). This completely recovers the initial investment and gas fees.
+4. **Dynamic Trailing Moonbag:** After TP1, the remaining tokens enter "moonbag" mode. The bot establishes a dynamic trailing stop pegged to 75% of the token's *Highest Recorded Price*. As the price climbs, the stop-loss climbs with it, securing maximum upside while defending against sudden rug-pulls.
+5. **Time-Based Capitulation:** If a token stalls and fails to reach +20% within **5 minutes** (300 seconds), the bot autonomously executes a market sell to free up trapped capital for higher-velocity opportunities.
 
 ---
 
