@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use reqwest::header::{HeaderMap, HeaderValue};
+use serde::{Deserialize, Serialize};
 
 // ============================================================
 // Birdeye API Client — Core Data Source for HawkEye Shield
@@ -116,12 +117,60 @@ impl BirdeyeClient {
     }
 
     // ─── Token Price (replaces Jupiter Price API fallback) ───
-    pub async fn get_price(&self, address: &str) -> Result<f64, String> {
+    pub async fn get_price(&self, address: &str) -> Result<f64, Box<dyn std::error::Error>> {
         let url = format!("{}/defi/price?address={}", self.base_url, address);
-        let body = self.get_with_retry(&url).await?;
+        let resp = self.client
+            .get(&url)
+            .send()
+            .await?;
 
-        body["data"]["value"].as_f64()
-            .ok_or_else(|| "Price not found".to_string())
+        let status = resp.status();
+        let body_text = resp.text().await?;
+
+        if !status.is_success() {
+            return Err(format!("API Error {}: {}", status, body_text).into());
+        }
+
+        let json: serde_json::Value = serde_json::from_str(&body_text)?;
+        if !json["success"].as_bool().unwrap_or(false) {
+            return Err(format!("API Error: {}", body_text).into());
+        }
+
+        let price = json["data"]["value"].as_f64().unwrap_or(0.0);
+        Ok(price)
+    }
+
+    pub async fn get_token_security(&self, address: &str) -> Result<TokenSecurity, String> {
+        let url = format!("{}/defi/token_security?address={}", self.base_url, address);
+        let resp = self.client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let status = resp.status();
+        let body_text = resp.text().await.unwrap_or_default();
+
+        if !status.is_success() {
+            return Err(format!("API Error {}: {}", status, body_text));
+        }
+
+        let json: serde_json::Value = serde_json::from_str(&body_text).map_err(|e| e.to_string())?;
+        if !json["success"].as_bool().unwrap_or(false) {
+            return Err(format!("API Error: {}", body_text));
+        }
+
+        let d = &json["data"];
+        
+        Ok(TokenSecurity {
+            is_mintable: d["mintable"].as_bool().or_else(|| d["isMintable"].as_bool()).or_else(|| d["mintAuthority"].is_string().then_some(true)),
+            is_freezable: d["freezable"].as_bool().or_else(|| d["isFreezable"].as_bool()).or_else(|| d["freezeAuthority"].is_string().then_some(true)),
+            top10_holder_percent: d["top10UserPercent"].as_f64().or_else(|| d["top10HolderPercent"].as_f64()),
+            creator_percentage: d["creatorPercentage"].as_f64().or_else(|| d["creatorBalance"].as_f64()),
+            owner_percentage: d["ownerPercentage"].as_f64(),
+            is_true_token: d["isTrueToken"].as_bool(),
+            is_honeypot: d["isHoneypot"].as_bool(),
+        })
     }
 
     // ─── Token Overview (replaces DexScreener token data) ───
@@ -151,22 +200,6 @@ impl BirdeyeClient {
             volume_1h: d["v1hUSD"].as_f64().unwrap_or(0.0),
             market_cap: d["mc"].as_f64().unwrap_or(0.0),
             created_at: d["createdAt"].as_i64(),
-        })
-    }
-
-    // ─── Token Security (replaces GMGN safety check) ───
-    pub async fn get_token_security(&self, address: &str) -> Result<TokenSecurity, String> {
-        let url = format!("{}/defi/token_security?address={}", self.base_url, address);
-        let body = self.get_with_retry(&url).await?;
-        let d = &body["data"];
-
-        Ok(TokenSecurity {
-            is_mintable: d["isMintable"].as_bool(),
-            is_freezable: d["isFreezable"].as_bool(),
-            top10_holder_percent: d["top10HolderPercent"].as_f64(),
-            creator_percentage: d["creatorPercentage"].as_f64(),
-            owner_percentage: d["ownerPercentage"].as_f64(),
-            is_true_token: d["isTrueToken"].as_bool(),
         })
     }
 
@@ -217,6 +250,15 @@ pub struct MemeTokenInfo {
     pub mc: f64,
     pub last_trade_unix_time: i64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradeData {
+    pub price: f64,
+    pub volume: f64,
+    pub trade_time: i64,
+    pub type_: String,
+}
+
 
 #[derive(Debug, Clone)]
 pub struct MemeDetail {
@@ -276,4 +318,5 @@ pub struct TokenSecurity {
     pub creator_percentage: Option<f64>,
     pub owner_percentage: Option<f64>,
     pub is_true_token: Option<bool>,
+    pub is_honeypot: Option<bool>, // Added to match
 }

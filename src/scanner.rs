@@ -484,6 +484,11 @@ impl Scanner {
             return Ok(false);
         }
 
+        if security.is_honeypot == Some(true) {
+            tui_state.log_scanner(&format!("  ❌ ${} Honeypot detected", address));
+            return Ok(false);
+        }
+
         tui_state.log_scanner(&format!("  ✅ ${} Passed safety checks (Birdeye Security)", address));
         Ok(true)
     }
